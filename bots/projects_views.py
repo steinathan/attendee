@@ -359,7 +359,7 @@ class CreateWebhookView(LoginRequiredMixin, ProjectUrlContextMixin, View):
         if WebhookSubscription.objects.filter(url=url, project=project).exists():
             return HttpResponse("URL already subscribed", status=400)
         # There is a limit of 2 webhooks per projects for now
-        if WebhookSubscription.objects.filter(project=project).count() >= 2:
+        if WebhookSubscription.objects.filter(project=project).count() >= 7:
             return HttpResponse("You have reached the maximum number of webhooks", status=400)
 
         # Check the event is subscribable
