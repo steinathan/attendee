@@ -223,6 +223,19 @@
 
 <!-- Add this style block -->
 <style>
+    /* Rotate chevron based on expanded state */
+    [aria-expanded="true"] .bi-chevron-down {
+        transform: rotate(180deg);
+    }
+    
+    [aria-expanded="false"] .bi-chevron-down {
+        transform: rotate(0deg);
+    }
+
+    .collapse, .collapsing {
+        transition-duration: 0s !important;
+    }
+
     .sidebar .nav-link.active {
         background-color: rgba(0, 0, 0, 0.09);
         color: inherit;

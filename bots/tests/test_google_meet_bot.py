@@ -27,6 +27,7 @@ from bots.models import (
     Project,
     Recording,
     RecordingStates,
+    RecordingTranscriptionStates,
     RecordingTypes,
     TranscriptionProviders,
     TranscriptionTypes,
@@ -280,6 +281,8 @@ class TestGoogleMeetBot(TransactionTestCase):
         # Verify that the recording was finished
         self.recording.refresh_from_db()
         self.assertEqual(self.recording.state, RecordingStates.COMPLETE)
+        self.assertEqual(self.recording.transcription_state, RecordingTranscriptionStates.COMPLETE)
+        self.assertEqual(self.recording.transcription_failure_data, None)
 
         # Verify Deepgram was called to transcribe the audio
         mock_deepgram.listen.rest.v.return_value.transcribe_file.assert_called()
@@ -289,7 +292,7 @@ class TestGoogleMeetBot(TransactionTestCase):
         self.assertGreater(utterances.count(), 0)
 
         # Verify an audio utterance exists with the correct transcription
-        audio_utterance = utterances.filter(source=Utterance.Sources.PER_PARTICIPANT_AUDIO).first()
+        audio_utterance = utterances.filter(source=Utterance.Sources.PER_PARTICIPANT_AUDIO, failure_data__isnull=True).first()
         self.assertIsNotNone(audio_utterance)
         self.assertEqual(audio_utterance.transcription.get("transcript"), "This is a test transcription from Deepgram")
 

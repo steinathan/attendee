@@ -14,7 +14,7 @@ from django.urls import reverse
 from django.views import View
 from django.views.generic.list import ListView
 
-from .bots_api_utils import create_bot, launch_bot
+from .bots_api_utils import BotCreationSource, create_bot, launch_bot
 from .models import (
     ApiKey,
     Bot,
@@ -63,6 +63,8 @@ class ProjectDashboardView(LoginRequiredMixin, ProjectUrlContextMixin, View):
 
         has_ended_bots = Bot.objects.filter(project=project, state=BotStates.ENDED).exists()
 
+        has_created_bots_via_api = BotEvent.objects.filter(bot__project=project, event_type=BotEventTypes.JOIN_REQUESTED, metadata__source=BotCreationSource.API).exists()
+
         context = self.get_project_context(object_id, project)
         context.update(
             {
@@ -70,6 +72,7 @@ class ProjectDashboardView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                     "has_credentials": zoom_credentials and deepgram_credentials,
                     "has_api_keys": has_api_keys,
                     "has_ended_bots": has_ended_bots,
+                    "has_created_bots_via_api": has_created_bots_via_api,
                 }
             }
         )
@@ -293,6 +296,9 @@ class ProjectBotsView(LoginRequiredMixin, ProjectUrlContextMixin, ListView):
         # Add filter parameters to context for maintaining state
         context["filter_params"] = {"start_date": self.request.GET.get("start_date", ""), "end_date": self.request.GET.get("end_date", ""), "states": self.request.GET.getlist("states")}
 
+        # Add flag to detect if create modal should be automatically opened
+        context["open_create_modal"] = self.request.GET.get("open_create_modal") == "true"
+
         return context
 
 
@@ -512,7 +518,7 @@ class CreateBotView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                 "bot_name": request.POST.get("bot_name") or "Meeting Bot",
             }
 
-            bot, error = create_bot(data, project)
+            bot, error = create_bot(data=data, source=BotCreationSource.DASHBOARD, project=project)
             if error:
                 return HttpResponse(json.dumps(error), status=400)
 

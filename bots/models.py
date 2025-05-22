@@ -187,6 +187,18 @@ class Bot(models.Model):
                     raise
                 continue
 
+    def bot_duration_seconds(self) -> int:
+        if self.first_heartbeat_timestamp is None or self.last_heartbeat_timestamp is None:
+            return 0
+        if self.last_heartbeat_timestamp < self.first_heartbeat_timestamp:
+            return 0
+        seconds_active = self.last_heartbeat_timestamp - self.first_heartbeat_timestamp
+        # If first and last heartbeat are the same, we don't know the exact time the bot was active
+        # So we'll assume it ran for 30 seconds
+        if self.last_heartbeat_timestamp == self.first_heartbeat_timestamp:
+            seconds_active = 30
+        return seconds_active
+
     def centicredits_consumed(self) -> int:
         if self.first_heartbeat_timestamp is None or self.last_heartbeat_timestamp is None:
             return 0
@@ -261,6 +273,13 @@ class Bot(models.Model):
             recording_settings = {}
         return recording_settings.get("format", RecordingFormats.MP4)
 
+    def recording_dimensions(self):
+        recording_settings = self.settings.get("recording_settings", {})
+        if recording_settings is None:
+            recording_settings = {}
+        resolution_value = recording_settings.get("resolution", RecordingResolutions.HD_1080P)
+        return RecordingResolutions.get_dimensions(resolution_value)
+
     def recording_view(self):
         recording_settings = self.settings.get("recording_settings", {})
         if recording_settings is None:
@@ -271,7 +290,8 @@ class Bot(models.Model):
         from bots.utils import meeting_type_from_url
 
         # Temporarily enabling this for all google meet meetings
-        if meeting_type_from_url(self.meeting_url) == MeetingTypes.GOOGLE_MEET:
+        bot_meeting_type = meeting_type_from_url(self.meeting_url)
+        if bot_meeting_type == MeetingTypes.GOOGLE_MEET or bot_meeting_type == MeetingTypes.TEAMS:
             return True
 
         debug_settings = self.settings.get("debug_settings", {})
@@ -637,8 +657,8 @@ class BotEventManager:
         return state in cls.POST_MEETING_STATES
 
     @classmethod
-    def bot_event_should_incur_charges(cls, event: BotEvent):
-        if event.event_type == BotEventTypes.FATAL_ERROR:
+    def bot_event_type_should_incur_charges(cls, event_type: int):
+        if event_type == BotEventTypes.FATAL_ERROR:
             return False
         return True
 
@@ -649,6 +669,47 @@ class BotEventManager:
         for state in cls.POST_MEETING_STATES:
             q_filter |= models.Q(state=state)
         return q_filter
+
+    @classmethod
+    def after_new_state_is_joined_recording(cls, bot: Bot, new_state: BotStates):
+        pending_recordings = bot.recordings.filter(state=RecordingStates.NOT_STARTED)
+        if pending_recordings.count() != 1:
+            raise ValidationError(f"Expected exactly one pending recording for bot {bot.object_id} in state {BotStates.state_to_api_code(new_state)}, but found {pending_recordings.count()}")
+        pending_recording = pending_recordings.first()
+        RecordingManager.set_recording_in_progress(pending_recording)
+
+    # This method handles sets the state for recordings and credits for when the bot transitions to a post meeting state
+    # It returns a dictionary of additional event metadata that should be added to the event
+    @classmethod
+    def after_transition_to_post_meeting_state(cls, bot: Bot, event_type: BotEventTypes, new_state: BotStates) -> dict:
+        additional_event_metadata = {}
+        additional_event_metadata["bot_duration_seconds"] = bot.bot_duration_seconds()
+
+        # If there is an in progress recording, terminate it
+        in_progress_recordings = bot.recordings.filter(state=RecordingStates.IN_PROGRESS)
+        if in_progress_recordings.count() > 1:
+            raise ValidationError(f"Expected at most one in progress recording for bot {bot.object_id} in state {BotStates.state_to_api_code(new_state)}, but found {in_progress_recordings.count()}")
+        for recording in in_progress_recordings:
+            RecordingManager.terminate_recording(recording)
+        for failed_transcription_recording in bot.recordings.filter(transcription_state=RecordingTranscriptionStates.FAILED):
+            # Collect all transcription errors
+            if failed_transcription_recording.transcription_failure_data and failed_transcription_recording.transcription_failure_data.get("failure_reasons"):
+                if "transcription_errors" not in additional_event_metadata:
+                    additional_event_metadata["transcription_errors"] = []
+                additional_event_metadata["transcription_errors"].extend(failed_transcription_recording.transcription_failure_data["failure_reasons"])
+
+        if settings.CHARGE_CREDITS_FOR_BOTS and cls.bot_event_type_should_incur_charges(event_type):
+            centicredits_consumed = bot.centicredits_consumed()
+            if centicredits_consumed > 0:
+                CreditTransactionManager.create_transaction(
+                    organization=bot.project.organization,
+                    centicredits_delta=-centicredits_consumed,
+                    bot=bot,
+                    description=f"For bot {bot.object_id}",
+                )
+                additional_event_metadata["credits_consumed"] = centicredits_consumed / 100
+
+        return additional_event_metadata
 
     @classmethod
     def create_event(
@@ -711,6 +772,23 @@ class BotEventManager:
                     if bot.state != new_state:
                         raise ValidationError(f"Bot state was modified by another thread to be '{BotStates.state_to_api_code(bot.state)}' instead of '{BotStates.state_to_api_code(new_state)}'.")
 
+                    # These two blocks below are hooks for things that need to happen when the bot state changes
+
+                    # If we moved to the recording state
+                    if new_state == BotStates.JOINED_RECORDING:
+                        cls.after_new_state_is_joined_recording(bot=bot, new_state=new_state)
+
+                    # If we transitioned to a post meeting state
+                    transitioned_to_post_meeting_state = cls.is_post_meeting_state(new_state) and not cls.is_post_meeting_state(old_state)
+                    if transitioned_to_post_meeting_state:
+                        # This helper method handles setting the state for recordings and credits for when the bot transitions to a post meeting state
+                        # It returns a dictionary of additional event metadata that should be added to the event
+                        additional_event_metadata = cls.after_transition_to_post_meeting_state(bot=bot, event_type=event_type, new_state=new_state)
+                        if additional_event_metadata:
+                            if event_metadata is None:
+                                event_metadata = {}
+                            event_metadata.update(additional_event_metadata)
+
                     # Create event record
                     event = BotEvent.objects.create(
                         bot=bot,
@@ -720,34 +798,6 @@ class BotEventManager:
                         event_sub_type=event_sub_type,
                         metadata=event_metadata,
                     )
-
-                    # If we moved to the recording state
-                    if new_state == BotStates.JOINED_RECORDING:
-                        pending_recordings = bot.recordings.filter(state=RecordingStates.NOT_STARTED)
-                        if pending_recordings.count() != 1:
-                            raise ValidationError(f"Expected exactly one pending recording for bot {bot.object_id} in state {BotStates.state_to_api_code(new_state)}, but found {pending_recordings.count()}")
-                        pending_recording = pending_recordings.first()
-                        RecordingManager.set_recording_in_progress(pending_recording)
-
-                    # If we transitioned to a post meeting state
-                    transitioned_to_post_meeting_state = cls.is_post_meeting_state(new_state) and not cls.is_post_meeting_state(old_state)
-                    if transitioned_to_post_meeting_state:
-                        # If there is an in progress recording, set it to complete
-                        in_progress_recordings = bot.recordings.filter(state=RecordingStates.IN_PROGRESS)
-                        if in_progress_recordings.count() > 1:
-                            raise ValidationError(f"Expected at most one in progress recording for bot {bot.object_id} in state {BotStates.state_to_api_code(new_state)}, but found {in_progress_recordings.count()}")
-                        for recording in in_progress_recordings:
-                            RecordingManager.set_recording_complete(recording)
-
-                        if settings.CHARGE_CREDITS_FOR_BOTS and cls.bot_event_should_incur_charges(event):
-                            centicredits_consumed = bot.centicredits_consumed()
-                            if centicredits_consumed > 0:
-                                CreditTransactionManager.create_transaction(
-                                    organization=bot.project.organization,
-                                    centicredits_delta=-centicredits_consumed,
-                                    bot=bot,
-                                    description=f"For bot {bot.object_id}",
-                                )
 
                     # Trigger webhook for this event
                     trigger_webhook(
@@ -829,6 +879,20 @@ class RecordingTypes(models.IntegerChoices):
     AUDIO_ONLY = 2, "Audio Only"
 
 
+class RecordingResolutions(models.TextChoices):
+    HD_1080P = "1080p"
+    HD_720P = "720p"
+
+    @classmethod
+    def get_dimensions(cls, value):
+        """Returns the width and height for a given resolution value"""
+        dimensions = {
+            cls.HD_1080P: (1920, 1080),
+            cls.HD_720P: (1280, 720),
+        }
+        return dimensions.get(value)
+
+
 class TranscriptionTypes(models.IntegerChoices):
     NON_REALTIME = 1, "Non realtime"
     REALTIME = 2, "Realtime"
@@ -865,6 +929,8 @@ class Recording(models.Model):
         default=RecordingTranscriptionStates.NOT_STARTED,
         null=False,
     )
+
+    transcription_failure_data = models.JSONField(null=True, default=None)
 
     transcription_provider = models.IntegerField(choices=TranscriptionProviders.choices, null=True, blank=True)
 
@@ -903,6 +969,32 @@ class Recording(models.Model):
 
 
 class RecordingManager:
+    # Moves the recording into a terminal state.
+    # If the recording failed, then mark it as failed.
+    # If the recording succeeded, then mark it as succeeded
+    # If the transcription failed, then mark it as failed
+    # If the transcription succeeded, then mark it as succeeded
+    @classmethod
+    def terminate_recording(cls, recording: Recording):
+        if recording.state == RecordingStates.IN_PROGRESS:
+            # If we don't have a recording file, then it failed.
+            if recording.file:
+                RecordingManager.set_recording_complete(recording)
+            else:
+                RecordingManager.set_recording_failed(recording)
+
+        if recording.transcription_state == RecordingTranscriptionStates.IN_PROGRESS:
+            # We'll mark it as failed if there are any failed utterances or any in progress utterances
+            any_in_progress_utterances = recording.utterances.filter(transcription__isnull=True, failure_data__isnull=True).exists()
+            any_failed_utterances = recording.utterances.filter(failure_data__isnull=False).exists()
+            if any_failed_utterances or any_in_progress_utterances:
+                failure_reasons = list(recording.utterances.filter(failure_data__has_key="reason").values_list("failure_data__reason", flat=True).distinct())
+                if any_in_progress_utterances:
+                    failure_reasons.append(TranscriptionFailureReasons.UTTERANCES_STILL_IN_PROGRESS_WHEN_RECORDING_TERMINATED)
+                RecordingManager.set_recording_transcription_failed(recording, failure_data={"failure_reasons": failure_reasons})
+            else:
+                RecordingManager.set_recording_transcription_complete(recording)
+
     @classmethod
     def set_recording_in_progress(cls, recording: Recording):
         recording.refresh_from_db()
@@ -977,7 +1069,7 @@ class RecordingManager:
         recording.save()
 
     @classmethod
-    def set_recording_transcription_failed(cls, recording: Recording):
+    def set_recording_transcription_failed(cls, recording: Recording, failure_data: dict):
         recording.refresh_from_db()
 
         if recording.transcription_state == RecordingTranscriptionStates.FAILED:
@@ -987,8 +1079,8 @@ class RecordingManager:
         if recording.state != RecordingStates.COMPLETE and recording.state != RecordingStates.FAILED and recording.state != RecordingStates.IN_PROGRESS:
             raise ValueError(f"Invalid state transition. Recording {recording.id} is in recording state {recording.get_state_display()}")
 
-        # todo: ADD REASON WHY IT FAILED STORAGE? OR MAYBE PUT IN THE EVENTs?
         recording.transcription_state = RecordingTranscriptionStates.FAILED
+        recording.transcription_failure_data = failure_data
         recording.save()
 
     @classmethod
@@ -996,7 +1088,23 @@ class RecordingManager:
         return state == RecordingStates.COMPLETE or state == RecordingStates.FAILED
 
 
+class TranscriptionFailureReasons(models.TextChoices):
+    CREDENTIALS_NOT_FOUND = "credentials_not_found"
+    CREDENTIALS_INVALID = "credentials_invalid"
+    RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"
+    AUDIO_UPLOAD_FAILED = "audio_upload_failed"
+    TRANSCRIPTION_REQUEST_FAILED = "transcription_request_failed"
+    TIMED_OUT = "timed_out"
+    INTERNAL_ERROR = "internal_error"
+    # This reason applies to the transcription operation as a whole, not a specific utterance
+    UTTERANCES_STILL_IN_PROGRESS_WHEN_RECORDING_TERMINATED = "utterances_still_in_progress_when_recording_terminated"
+
+
 class Utterance(models.Model):
+    # If transcription is None and failure_data is not None, then the transcription failed
+    # If transcription is not None and failure_data is None, then the transcription succeeded
+    # If transcription is None and failure_data is None, then the transcription is in progress
+
     class Sources(models.IntegerChoices):
         PER_PARTICIPANT_AUDIO = 1, "Per Participant Audio"
         CLOSED_CAPTION_FROM_PLATFORM = 2, "Closed Caption From Platform"
@@ -1012,6 +1120,9 @@ class Utterance(models.Model):
     timestamp_ms = models.BigIntegerField()
     duration_ms = models.IntegerField()
     transcription = models.JSONField(null=True, default=None)
+    # To keep track of how many retries we've done for this utterance
+    transcription_attempt_count = models.IntegerField(default=0)
+    failure_data = models.JSONField(null=True, default=None)
     source_uuid = models.CharField(max_length=255, null=True, unique=True)
     sample_rate = models.IntegerField(null=True, default=None)
 

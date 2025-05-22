@@ -14,7 +14,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .authentication import ApiKeyAuthentication
-from .bots_api_utils import create_bot, create_bot_media_request_for_image, launch_bot, send_sync_command
+from .bots_api_utils import BotCreationSource, create_bot, create_bot_media_request_for_image, launch_bot, send_sync_command
 from .models import (
     Bot,
     BotEventManager,
@@ -131,7 +131,7 @@ class BotCreateView(APIView):
         tags=["Bots"],
     )
     def post(self, request):
-        bot, error = create_bot(request.data, request.auth.project)
+        bot, error = create_bot(data=request.data, source=BotCreationSource.API, project=request.auth.project)
         if error:
             return Response(error, status=status.HTTP_400_BAD_REQUEST)
 

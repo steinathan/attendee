@@ -88,6 +88,14 @@
                 const modal = bootstrap.Modal.getInstance(document.getElementById('createBotModal'));
                 modal.hide();
                 
+                // Remove the query parameter from the URL
+                const url = new URL(window.location.href);
+                if (url.searchParams.has('open_create_modal')) {
+                    url.searchParams.delete('open_create_modal');
+                    // Update URL without reloading the page
+                    window.history.replaceState({}, '', url.toString());
+                }
+
                 // Refresh the page
                 window.location.reload();
             } else {

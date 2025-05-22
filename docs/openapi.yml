@@ -733,10 +733,18 @@ components:
               type: string
               description: The view to use for the recording. The supported views
                 are 'speaker_view' and 'gallery_view'.
+            resolution:
+              type: string
+              description: The resolution to use for the recording. The supported
+                resolutions are '1080p' and '720p'. Defaults to '1080p'.
+              enum:
+              - 1080p
+              - 720p
           required: []
           default:
             format: mp4
             view: speaker_view
+            resolution: 1080p
           description: The settings for the bot's recording. Currently the only setting
             is 'view' which can be 'speaker_view' or 'gallery_view'.
         debug_settings:

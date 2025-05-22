@@ -42,6 +42,7 @@ class WebBotAdapter(BotAdapter):
         should_create_debug_recording: bool,
         start_recording_screen_callback,
         stop_recording_screen_callback,
+        video_frame_size: tuple[int, int],
     ):
         self.display_name = display_name
         self.send_message_callback = send_message_callback
@@ -57,7 +58,7 @@ class WebBotAdapter(BotAdapter):
 
         self.meeting_url = meeting_url
 
-        self.video_frame_size = (1920, 1080)
+        self.video_frame_size = video_frame_size
 
         self.driver = None
 
@@ -125,13 +126,13 @@ class WebBotAdapter(BotAdapter):
                 logger.info(f"video dimensions {width} {height} message length {len(message) - offset - 8}")
             self.video_frame_ticker += 1
 
-            # Scale frame to 1920x1080
+            # Scale frame to video frame size
             expected_video_data_length = width * height + 2 * half_ceil(width) * half_ceil(height)
             video_data = np.frombuffer(message[offset + 8 :], dtype=np.uint8)
 
             # Check if len(video_data) does not agree with width and height
             if len(video_data) == expected_video_data_length:  # I420 format uses 1.5 bytes per pixel
-                scaled_i420_frame = scale_i420(video_data, (width, height), (1920, 1080))
+                scaled_i420_frame = scale_i420(video_data, (width, height), self.video_frame_size)
                 if self.wants_any_video_frames_callback() and self.send_frames:
                     self.add_video_frame_callback(scaled_i420_frame, timestamp * 1000)
 
@@ -359,7 +360,7 @@ class WebBotAdapter(BotAdapter):
         self.driver = webdriver.Chrome(options=options)
         logger.info(f"web driver server initialized at port {self.driver.service.port}")
 
-        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, collectCaptions: {'false' if self.add_audio_chunk_callback else 'true'}}}"
+        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, collectCaptions: {'false' if self.add_audio_chunk_callback else 'true'}}}"
 
         # Define the CDN libraries needed
         CDN_LIBRARIES = ["https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.4.0/protobuf.min.js", "https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"]
@@ -453,7 +454,7 @@ class WebBotAdapter(BotAdapter):
                     num_retries += 1
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected and {num_expected_exceptions} expected exceptions have occurred, so incrementing num_retries. This usually indicates that the meeting has not started yet, so we will wait for the configured amount of time which is 180 seconds before retrying")
                     # We're going to start a new pod to see if that fixes the issue
-                    self.send_message_callback({"message": self.Messages.BLOCKED_BY_GOOGLE_REPEATEDLY})
+                    self.send_message_callback({"message": self.Messages.BLOCKED_BY_PLATFORM_REPEATEDLY})
                     return
                 else:
                     logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected so not incrementing num_retries, but {num_expected_exceptions} expected exceptions have occurred")

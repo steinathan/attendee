@@ -20,6 +20,7 @@ from .models import (
     MeetingTypes,
     Recording,
     RecordingFormats,
+    RecordingResolutions,
     RecordingStates,
     RecordingTranscriptionStates,
     RecordingViews,
@@ -186,6 +187,11 @@ class RTMPSettingsJSONField(serializers.JSONField):
             "view": {
                 "type": "string",
                 "description": "The view to use for the recording. The supported views are 'speaker_view' and 'gallery_view'.",
+            },
+            "resolution": {
+                "type": "string",
+                "description": "The resolution to use for the recording. The supported resolutions are '1080p' and '720p'. Defaults to '1080p'.",
+                "enum": RecordingResolutions.values,
             },
         },
         "required": [],
@@ -411,7 +417,7 @@ class CreateBotSerializer(serializers.Serializer):
     recording_settings = RecordingSettingsJSONField(
         help_text="The settings for the bot's recording. Currently the only setting is 'view' which can be 'speaker_view' or 'gallery_view'.",
         required=False,
-        default={"format": RecordingFormats.MP4, "view": RecordingViews.SPEAKER_VIEW},
+        default={"format": RecordingFormats.MP4, "view": RecordingViews.SPEAKER_VIEW, "resolution": RecordingResolutions.HD_1080P},
     )
 
     RECORDING_SETTINGS_SCHEMA = {
@@ -419,6 +425,10 @@ class CreateBotSerializer(serializers.Serializer):
         "properties": {
             "format": {"type": "string"},
             "view": {"type": "string"},
+            "resolution": {
+                "type": "string",
+                "enum": list(RecordingResolutions.values),
+            },
         },
         "required": [],
     }
@@ -427,10 +437,19 @@ class CreateBotSerializer(serializers.Serializer):
         if value is None:
             return value
 
+        # Define defaults
+        defaults = {"format": RecordingFormats.MP4, "view": RecordingViews.SPEAKER_VIEW, "resolution": RecordingResolutions.HD_1080P}
+
         try:
             jsonschema.validate(instance=value, schema=self.RECORDING_SETTINGS_SCHEMA)
         except jsonschema.exceptions.ValidationError as e:
             raise serializers.ValidationError(e.message)
+
+        # If at least one attribute is provided, apply defaults for any missing attributes
+        if value:
+            for key, default_value in defaults.items():
+                if key not in value:
+                    value[key] = default_value
 
         # Validate format if provided
         format = value.get("format")

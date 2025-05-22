@@ -223,6 +223,27 @@
             caret.style.transform = 'rotate(0deg)';
         }
     }
+    
+    // Add script to automatically open the modal if the flag is set
+    document.addEventListener('DOMContentLoaded', function() {
+        {% if open_create_modal %}
+            const createBotModal = new bootstrap.Modal(document.getElementById('createBotModal'));
+            createBotModal.show();
+
+            // Add event listener to remove the query parameter when modal closes
+            document.getElementById('createBotModal').addEventListener('hidden.bs.modal', function() {
+                // Get current URL and remove the parameter
+                const url = new URL(window.location.href);
+                if (url.searchParams.has('open_create_modal')) {
+                    url.searchParams.delete('open_create_modal');
+                    // Update URL without reloading the page
+                    window.history.replaceState({}, '', url.toString());
+                }
+            });
+
+        {% endif %}
+    });
+    
 </script>
 
 {% endblock %} 

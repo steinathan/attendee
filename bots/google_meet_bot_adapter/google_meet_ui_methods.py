@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 from selenium.common.exceptions import ElementNotInteractableException, NoSuchElementException, TimeoutException
@@ -234,6 +235,52 @@ class GoogleMeetUIMethods:
         else:
             return "sidebar"
 
+    def turn_off_reactions(self):
+        try:
+            self.attempt_to_turn_off_reactions()
+        except Exception as e:
+            logger.info(f"Error turning off reactions: {e}")
+
+    def attempt_to_turn_off_reactions(self):
+        logger.info("Attempting to turn off reactions")
+        logger.info("Waiting for the more options button...")
+        MORE_OPTIONS_BUTTON_SELECTOR = 'button[jsname="NakZHc"][aria-label="More options"]'
+        more_options_button = self.locate_element(
+            step="more_options_button_for_language_selection",
+            condition=EC.presence_of_element_located((By.CSS_SELECTOR, MORE_OPTIONS_BUTTON_SELECTOR)),
+            wait_time_seconds=6,
+        )
+        logger.info("Clicking the more options button...")
+        self.click_element(more_options_button, "more_options_button")
+
+        logger.info("Waiting for the settings list item...")
+        settings_list_item = self.locate_element(
+            step="settings_list_item",
+            condition=EC.presence_of_element_located((By.XPATH, '//li[.//span[text()="Settings"]]')),
+            wait_time_seconds=6,
+        )
+        logger.info("Clicking the settings list item...")
+        self.click_element(settings_list_item, "settings_list_item")
+
+        logger.info("Waiting for the reactions tab...")
+        self.locate_element(
+            step="reactions_tab",
+            condition=EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Reactions"]')),
+            wait_time_seconds=6,
+        )
+
+        # Use javascript to click the reactions button
+        self.driver.execute_script("document.querySelector('button[aria-label=\"Show reactions from others\"]').click();")
+
+        logger.info("Waiting for the close button")
+        close_button = self.locate_element(
+            step="close_button_for_language_selection",
+            condition=EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Close dialog"]')),
+            wait_time_seconds=6,
+        )
+        logger.info("Clicking the close button")
+        self.click_element(close_button, "close_button")
+
     def set_layout(self, layout_to_select):
         num_attempts = 3
         for attempt_index in range(num_attempts):
@@ -364,6 +411,9 @@ class GoogleMeetUIMethods:
 
         if self.google_meet_closed_captions_language:
             self.select_language(self.google_meet_closed_captions_language)
+
+        if os.getenv("DO_NOT_RECORD_MEETING_REACTIONS") == "true":
+            self.turn_off_reactions()
 
         self.ready_to_show_bot_image()
 

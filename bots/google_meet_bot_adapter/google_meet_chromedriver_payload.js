@@ -252,14 +252,6 @@ class StyleManager {
             return;
         }
 
-        if (!this.lastParticipantsListDomMessageSentAt || Date.now() - this.lastParticipantsListDomMessageSentAt > 300000) {
-            window.ws.sendJson({
-                type: 'ParticipantsListDomMessage',
-                message: participantList.innerHTML
-            });
-            this.lastParticipantsListDomMessageSentAt = Date.now();
-        }
-
         const participantListItems = participantList.querySelectorAll('div[role="listitem"]');
         // console.log('participantListItems', participantListItems);
         for (const participantListItem of participantListItems) {
@@ -287,6 +279,12 @@ class StyleManager {
                 }
                 // Add the missing click action
                 unpinButton.click();
+
+                window.ws.sendJson({
+                    type: 'UiInteraction',
+                    message: 'Unpinned pinned video',
+                    participantListItemDom: participantListItem.outerHTML
+                });
             }, 200);
         }
     }
@@ -685,7 +683,7 @@ class WebSocketClient {
   We no longer need this because we're not using MediaStreamTrackProcessor's
   getBlackFrame() {
     // Create black frame data (I420 format)
-    const width = 1920, height = 1080;
+    const width = window.initialData.videoFrameWidth, height = window.initialData.videoFrameHeight;
     const yPlaneSize = width * height;
     const uvPlaneSize = (width * height) / 4;
 

@@ -6,6 +6,7 @@ class StyleManager {
         this.silenceCheckInterval = null;
         this.frameStyleElement = null;
         this.frameAdjustInterval = null;
+        this.neededInteractionsInterval = null;
     }
 
     addAudioTrack(audioTrack) {
@@ -31,6 +32,19 @@ class StyleManager {
                 type: 'SilenceStatus',
                 isSilent: false
             });
+        }
+    }
+
+    checkNeededInteractions() {
+        // Check if bot has been removed from the meeting
+        const removedFromMeetingElement = document.getElementById('calling-retry-screen-title');
+        if (removedFromMeetingElement && 
+            removedFromMeetingElement.textContent.includes("You've been removed from this meeting")) {
+            window.ws.sendJson({
+                type: 'MeetingStatusChange',
+                change: 'removed_from_meeting'
+            });
+            console.log('Bot was removed from meeting, sent notification');
         }
     }
 
@@ -68,10 +82,19 @@ class StyleManager {
             clearInterval(this.silenceCheckInterval);
         }
                 
+        if (this.neededInteractionsInterval) {
+            clearInterval(this.neededInteractionsInterval);
+        }
+                
         // Check for audio activity every second
         this.silenceCheckInterval = setInterval(() => {
             this.checkAudioActivity();
         }, 1000);
+
+        // Check for needed interactions every 5 seconds
+        this.neededInteractionsInterval = setInterval(() => {
+            this.checkNeededInteractions();
+        }, 5000);
     }
 
     makeMainVideoFillFrame() {
@@ -128,8 +151,8 @@ class StyleManager {
         // Function to remove width and height from inline styles
         function adjustCentralElementSize(element) {
             if (element.style) {
-                element.style.width = '1920px';
-                element.style.height = '1080px';
+                element.style.width = `${window.initialData.videoFrameWidth}px`;
+                element.style.height = `${window.initialData.videoFrameHeight}px`;
             }
         }
         
@@ -161,6 +184,11 @@ class StyleManager {
         if (this.silenceCheckInterval) {
             clearInterval(this.silenceCheckInterval);
             this.silenceCheckInterval = null;
+        }
+        
+        if (this.neededInteractionsInterval) {
+            clearInterval(this.neededInteractionsInterval);
+            this.neededInteractionsInterval = null;
         }
         
         // Restore original frame layout
@@ -789,7 +817,7 @@ class WebSocketClient {
               const currentTime = performance.now();
               if (currentTime - this.lastVideoFrameTime >= 500 && this.mediaSendingEnabled) {
                   // Create black frame data (I420 format)
-                  const width = 1920, height = 1080;
+                  const width = window.initialData.videoFrameWidth, height = window.initialData.videoFrameHeight;
                   const yPlaneSize = width * height;
                   const uvPlaneSize = (width * height) / 4;
                   

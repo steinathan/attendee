@@ -83,6 +83,7 @@ class ZoomBotAdapter(BotAdapter):
         wants_any_video_frames_callback,
         add_mixed_audio_chunk_callback,
         automatic_leave_configuration: AutomaticLeaveConfiguration,
+        video_frame_size: tuple[int, int],
     ):
         self.use_one_way_audio = use_one_way_audio
         self.use_mixed_audio = use_mixed_audio
@@ -130,7 +131,7 @@ class ZoomBotAdapter(BotAdapter):
         self.video_sender = None
         self.virtual_camera_video_source = None
         self.video_source_helper = None
-        self.video_frame_size = (1920, 1080)
+        self.video_frame_size = video_frame_size
         self.send_image_timeout_id = None
 
         self.automatic_leave_configuration = automatic_leave_configuration

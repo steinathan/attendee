@@ -1,7 +1,7 @@
 from django.test import TestCase
 
 from accounts.models import Organization
-from bots.bots_api_utils import create_bot, validate_meeting_url_and_credentials
+from bots.bots_api_utils import BotCreationSource, create_bot, validate_meeting_url_and_credentials
 from bots.models import Project
 
 
@@ -36,20 +36,22 @@ class TestCreateBot(TestCase):
         self.project = Project.objects.create(name="Test Project", organization=organization)
 
     def test_create_bot(self):
-        bot, error = create_bot({"meeting_url": "https://meet.google.com/abc-defg-hij", "bot_name": "Test Bot"}, self.project)
+        bot, error = create_bot(data={"meeting_url": "https://meet.google.com/abc-defg-hij", "bot_name": "Test Bot"}, source=BotCreationSource.API, project=self.project)
         self.assertIsNotNone(bot)
         self.assertIsNotNone(bot.recordings.first())
         self.assertIsNone(error)
 
     def test_create_bot_with_image(self):
-        bot, error = create_bot({"meeting_url": "https://teams.microsoft.com/meeting/123", "bot_name": "Test Bot", "bot_image": {"type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}}, self.project)
+        bot, error = create_bot(data={"meeting_url": "https://teams.microsoft.com/meeting/123", "bot_name": "Test Bot", "bot_image": {"type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}}, source=BotCreationSource.API, project=self.project)
         self.assertIsNotNone(bot)
         self.assertIsNotNone(bot.recordings.first())
         self.assertIsNotNone(bot.media_requests.first())
         self.assertIsNone(error)
+        self.assertEqual(bot.bot_events.first().metadata["source"], BotCreationSource.API)
 
     def create_bot_with_google_meet_url_with_http(self):
-        bot, error = create_bot({"meeting_url": "http://meet.google.com/abc-defg-hij", "bot_name": "Test Bot"}, self.project)
+        bot, error = create_bot(data={"meeting_url": "http://meet.google.com/abc-defg-hij", "bot_name": "Test Bot"}, source=BotCreationSource.DASHBOARD, project=self.project)
         self.assertIsNotNone(bot)
         self.assertIsNotNone(error)
         self.assertEqual(error, {"error": "Google Meet URL must start with https://meet.google.com/"})
+        self.assertEqual(bot.bot_events.first().metadata["source"], BotCreationSource.DASHBOARD)

@@ -54,6 +54,9 @@ logger = logging.getLogger(__name__)
 
 
 class BotController:
+    # Default wait time for utterance termination (5 minutes)
+    UTTERANCE_TERMINATION_WAIT_TIME_SECONDS = 300
+
     def per_participant_audio_input_manager(self):
         if self.bot_in_db.deepgram_use_streaming():
             return self.per_participant_streaming_audio_input_manager
@@ -84,6 +87,7 @@ class BotController:
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
             start_recording_screen_callback=self.screen_and_audio_recorder.start_recording,
             stop_recording_screen_callback=self.screen_and_audio_recorder.stop_recording,
+            video_frame_size=self.bot_in_db.recording_dimensions(),
         )
 
     def get_teams_bot_adapter(self):
@@ -104,6 +108,7 @@ class BotController:
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
             start_recording_screen_callback=self.screen_and_audio_recorder.start_recording,
             stop_recording_screen_callback=self.screen_and_audio_recorder.stop_recording,
+            video_frame_size=self.bot_in_db.recording_dimensions(),
         )
 
     def get_zoom_bot_adapter(self):
@@ -133,6 +138,7 @@ class BotController:
             wants_any_video_frames_callback=self.gstreamer_pipeline.wants_any_video_frames,
             add_mixed_audio_chunk_callback=self.gstreamer_pipeline.on_mixed_audio_raw_data_received_callback,
             automatic_leave_configuration=self.automatic_leave_configuration,
+            video_frame_size=self.bot_in_db.recording_dimensions(),
         )
 
     def get_meeting_type(self):
@@ -285,9 +291,29 @@ class BotController:
             self.save_debug_recording()
 
         if self.bot_in_db.state == BotStates.POST_PROCESSING:
+            self.wait_until_all_utterances_are_terminated()
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.POST_PROCESSING_COMPLETED)
 
         normal_quitting_process_worked = True
+
+    # We're going to wait until all utterances are transcribed or have failed. If there are still
+    # in progress utterances, after 5 minutes, then we'll consider them failed and mark them as timed out.
+    def wait_until_all_utterances_are_terminated(self):
+        default_recording = self.bot_in_db.recordings.get(is_default_recording=True)
+
+        start_time = time.time()
+        wait_time_seconds = self.UTTERANCE_TERMINATION_WAIT_TIME_SECONDS
+        while time.time() - start_time < wait_time_seconds:
+            in_progress_utterances = default_recording.utterances.filter(transcription__isnull=True, failure_data__isnull=True)
+            # If no more in progress utterances, then we're done
+            if not in_progress_utterances.exists():
+                logger.info(f"All utterances are terminated for bot {self.bot_in_db.id}")
+                return
+
+            logger.info(f"Waiting for {len(in_progress_utterances)} utterances to terminate. It has been {time.time() - start_time} seconds. We will wait {wait_time_seconds} seconds.")
+            time.sleep(5)
+
+        logger.info(f"Timed out in post-processing waiting for utterances to terminate for bot {self.bot_in_db.id}. Transcription will be marked as failed because recording terminated.")
 
     def __init__(self, bot_id):
         self.bot_in_db = Bot.objects.get(id=bot_id)
@@ -391,7 +417,7 @@ class BotController:
         if self.should_create_gstreamer_pipeline():
             self.gstreamer_pipeline = GstreamerPipeline(
                 on_new_sample_callback=self.on_new_sample_from_gstreamer_pipeline,
-                video_frame_size=(1920, 1080),
+                video_frame_size=self.bot_in_db.recording_dimensions(),
                 audio_format=self.get_audio_format(),
                 output_format=self.get_gstreamer_output_format(),
                 num_audio_sources=self.get_num_audio_sources(),
@@ -404,6 +430,7 @@ class BotController:
         if self.should_create_screen_and_audio_recorder():
             self.screen_and_audio_recorder = ScreenAndAudioRecorder(
                 file_location=self.get_recording_file_location(),
+                recording_dimensions=self.bot_in_db.recording_dimensions(),
             )
 
         self.adapter = self.get_bot_adapter()
@@ -706,6 +733,9 @@ class BotController:
             sample_rate=message["sample_rate"],
         )
 
+        # Set the recording transcription in progress
+        RecordingManager.set_recording_transcription_in_progress(recording_in_progress)
+
         # Process the utterance immediately
         process_utterance.delay(utterance.id)
         return
@@ -758,11 +788,11 @@ class BotController:
             self.cleanup()
             return
 
-        if message.get("message") == BotAdapter.Messages.BLOCKED_BY_GOOGLE_REPEATEDLY:
+        if message.get("message") == BotAdapter.Messages.BLOCKED_BY_PLATFORM_REPEATEDLY:
             from bots.tasks.restart_bot_pod_task import restart_bot_pod
 
             if self.bot_in_db.created_at < timezone.now() - timedelta(minutes=15):
-                logger.info("Received message that we were blocked by google repeatedly but bot was created more than 15 minutes ago, so not recreating pod")
+                logger.info("Received message that we were blocked by platform repeatedly but bot was created more than 15 minutes ago, so not recreating pod")
 
                 new_bot_event = BotEventManager.create_event(
                     bot=self.bot_in_db,
@@ -775,7 +805,7 @@ class BotController:
                 self.cleanup()
                 return
 
-            logger.info("Received message that we were blocked by google repeatedly, so recreating pod")
+            logger.info("Received message that we were blocked by platform repeatedly, so recreating pod")
             # Run task to restart the bot pod with 1 minute delay
             restart_bot_pod.apply_async(args=[self.bot_in_db.id], countdown=60)
             # Don't do the normal cleanup tasks because we'll be restarting the pod
