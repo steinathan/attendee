@@ -37,6 +37,7 @@ class WebBotAdapter(BotAdapter):
         add_mixed_audio_chunk_callback,
         add_encoded_mp4_chunk_callback,
         upsert_caption_callback,
+        upsert_chat_message_callback,
         automatic_leave_configuration: AutomaticLeaveConfiguration,
         recording_view: RecordingViews,
         should_create_debug_recording: bool,
@@ -52,6 +53,7 @@ class WebBotAdapter(BotAdapter):
         self.wants_any_video_frames_callback = wants_any_video_frames_callback
         self.add_encoded_mp4_chunk_callback = add_encoded_mp4_chunk_callback
         self.upsert_caption_callback = upsert_caption_callback
+        self.upsert_chat_message_callback = upsert_chat_message_callback
         self.start_recording_screen_callback = start_recording_screen_callback
         self.stop_recording_screen_callback = stop_recording_screen_callback
         self.recording_view = recording_view
@@ -216,6 +218,9 @@ class WebBotAdapter(BotAdapter):
                             # Count a caption as audio activity
                             self.last_audio_message_processed_time = time.time()
                             self.upsert_caption_callback(json_data["caption"])
+
+                        elif json_data.get("type") == "ChatMessage":
+                            self.upsert_chat_message_callback(json_data)
 
                         elif json_data.get("type") == "UsersUpdate":
                             for user in json_data["newUsers"]:
@@ -583,6 +588,17 @@ class WebBotAdapter(BotAdapter):
             if time.time() - self.last_audio_message_processed_time > self.automatic_leave_configuration.silence_timeout_seconds:
                 logger.info(f"Auto-leaving meeting because there was no audio for {self.automatic_leave_configuration.silence_timeout_seconds} seconds")
                 self.send_message_callback({"message": self.Messages.ADAPTER_REQUESTED_BOT_LEAVE_MEETING, "leave_reason": BotAdapter.LEAVE_REASON.AUTO_LEAVE_SILENCE})
+                return
+
+        if self.joined_at is not None and self.automatic_leave_configuration.max_uptime_seconds is not None:
+            if time.time() - self.joined_at > self.automatic_leave_configuration.max_uptime_seconds:
+                logger.info(
+                    f"Auto-leaving meeting because bot has been running for more than {self.automatic_leave_configuration.max_uptime_seconds} seconds"
+                )
+                self.send_message_callback({
+                    "message": self.Messages.ADAPTER_REQUESTED_BOT_LEAVE_MEETING,
+                    "leave_reason": BotAdapter.LEAVE_REASON.AUTO_LEAVE_MAX_UPTIME
+                })
                 return
 
     def ready_to_show_bot_image(self):

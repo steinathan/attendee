@@ -167,6 +167,9 @@ class Bot(models.Model):
             # Delete all participants
             self.participants.all().delete()
 
+            # Delete all chat messages
+            self.chat_messages.all().delete()
+
             BotEventManager.create_event(bot=self, event_type=BotEventTypes.DATA_DELETED)
 
     def set_heartbeat(self):
@@ -473,7 +476,8 @@ class BotEventSubTypes(models.IntegerChoices):
     FATAL_ERROR_HEARTBEAT_TIMEOUT = 13, "Fatal error - Heartbeat timeout"
     COULD_NOT_JOIN_MEETING_MEETING_NOT_FOUND = 14, "Bot could not join meeting - Meeting not found"
     FATAL_ERROR_BOT_NOT_LAUNCHED = 15, "Fatal error - Bot not launched"
-    COULD_NOT_JOIN_MEETING_WAITING_ROOM_TIMEOUT_EXCEEDED = 16, "Bot could not join meeting - Waiting room timeout exceeded"
+    COULD_NOT_JOIN_MEETING_WAITING_ROOM_TIMEOUT_EXCEEDED = 16, "Bot could not join meeting - Waiting room timeout exceeded",
+    LEAVE_REQUESTED_AUTO_LEAVE_MAX_UPTIME_EXCEEDED = 17, "Leave requested - Auto leave max uptime exceeded"
 
     @classmethod
     def sub_type_to_api_code(cls, value):
@@ -495,6 +499,7 @@ class BotEventSubTypes(models.IntegerChoices):
             cls.COULD_NOT_JOIN_MEETING_MEETING_NOT_FOUND: "meeting_not_found",
             cls.FATAL_ERROR_BOT_NOT_LAUNCHED: "bot_not_launched",
             cls.COULD_NOT_JOIN_MEETING_WAITING_ROOM_TIMEOUT_EXCEEDED: "waiting_room_timeout_exceeded",
+            cls.LEAVE_REQUESTED_AUTO_LEAVE_MAX_UPTIME_EXCEEDED: "auto_leave_max_uptime_exceeded",
         }
         return mapping.get(value)
 
@@ -541,7 +546,7 @@ class BotEvent(models.Model):
                     (Q(event_type=BotEventTypes.COULD_NOT_JOIN) & (Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_NOT_STARTED_WAITING_FOR_HOST) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_WAITING_ROOM_TIMEOUT_EXCEEDED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_AUTHORIZATION_FAILED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_MEETING_STATUS_FAILED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_UNPUBLISHED_ZOOM_APP) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_SDK_INTERNAL_ERROR) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_REQUEST_TO_JOIN_DENIED) | Q(event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_MEETING_NOT_FOUND)))
                     |
                     # For LEAVE_REQUESTED event type, must have one of the valid event subtypes or be null (for backwards compatibility, this will eventually be removed)
-                    (Q(event_type=BotEventTypes.LEAVE_REQUESTED) & (Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_USER_REQUESTED) | Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_SILENCE) | Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_ONLY_PARTICIPANT_IN_MEETING) | Q(event_sub_type__isnull=True)))
+                    (Q(event_type=BotEventTypes.LEAVE_REQUESTED) & (Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_USER_REQUESTED) | Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_SILENCE) | Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_ONLY_PARTICIPANT_IN_MEETING) | Q(event_sub_type=BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_MAX_UPTIME_EXCEEDED) | Q(event_sub_type__isnull=True)))
                     |
                     # For all other events, event_sub_type must be null
                     (~Q(event_type=BotEventTypes.FATAL_ERROR) & ~Q(event_type=BotEventTypes.COULD_NOT_JOIN) & ~Q(event_type=BotEventTypes.LEAVE_REQUESTED) & Q(event_sub_type__isnull=True))
@@ -1486,3 +1491,31 @@ class WebhookDeliveryAttempt(models.Model):
             self.response_body_list = [response_body]
         else:
             self.response_body_list.append(response_body)
+
+
+class ChatMessageToOptions(models.IntegerChoices):
+    ONLY_BOT = 1, "only_bot"
+    EVERYONE = 2, "everyone"
+
+
+class ChatMessage(models.Model):
+    bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name="chat_messages")
+    text = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    participant = models.ForeignKey(Participant, on_delete=models.CASCADE, related_name="chat_messages")
+    to = models.IntegerField(choices=ChatMessageToOptions.choices, null=False)
+    timestamp = models.IntegerField()
+    additional_data = models.JSONField(null=False, default=dict)
+    object_id = models.CharField(max_length=32, unique=True, editable=False)
+
+    OBJECT_ID_PREFIX = "msg_"
+    object_id = models.CharField(max_length=32, unique=True, editable=False)
+    source_uuid = models.CharField(max_length=255, null=True, unique=True)
+
+    def save(self, *args, **kwargs):
+        if not self.object_id:
+            # Generate a random 16-character string
+            random_string = "".join(random.choices(string.ascii_letters + string.digits, k=16))
+            self.object_id = f"{self.OBJECT_ID_PREFIX}{random_string}"
+        super().save(*args, **kwargs)

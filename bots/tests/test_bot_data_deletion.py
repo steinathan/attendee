@@ -4,7 +4,7 @@ from django.core.files.base import ContentFile
 from django.test import TransactionTestCase
 from django.test.utils import override_settings
 
-from bots.models import Bot, BotEventTypes, BotStates, Organization, Participant, Project, Recording, RecordingStates, Utterance
+from bots.models import Bot, BotEventTypes, BotStates, ChatMessage, ChatMessageToOptions, Organization, Participant, Project, Recording, RecordingStates, Utterance
 
 
 def mock_file_field_delete_sets_name_to_none(instance, save=True):
@@ -85,6 +85,10 @@ class TestBotDataDeletion(TransactionTestCase):
 
         self.utterance2 = Utterance.objects.create(recording=self.recording2, participant=self.participant2, audio_blob=b"test audio 2", timestamp_ms=1000, duration_ms=500)
 
+        # Create chat messages for each bot
+        self.chat_message1 = ChatMessage.objects.create(bot=self.bot1, to=ChatMessageToOptions.ONLY_BOT, participant=self.participant1, text="Hello, world!", timestamp=1000)
+        self.chat_message2 = ChatMessage.objects.create(bot=self.bot2, to=ChatMessageToOptions.EVERYONE, participant=self.participant2, text="Hello, world!", timestamp=1000)
+
     def tearDown(self):
         # Stop all patches
         self.save_patch.stop()
@@ -105,11 +109,13 @@ class TestBotDataDeletion(TransactionTestCase):
         # Verify bot1's data is deleted
         self.assertEqual(Participant.objects.filter(bot=self.bot1).count(), 0)
         self.assertEqual(Utterance.objects.filter(recording__bot=self.bot1).count(), 0)
+        self.assertEqual(ChatMessage.objects.filter(bot=self.bot1).count(), 0)
 
         # Verify bot2's data is still intact
         self.assertEqual(Participant.objects.filter(bot=self.bot2).count(), 1)
         self.assertEqual(Recording.objects.filter(bot=self.bot2).count(), 1)
         self.assertEqual(Utterance.objects.filter(recording__bot=self.bot2).count(), 1)
+        self.assertEqual(ChatMessage.objects.filter(bot=self.bot2).count(), 1)
 
         # Verify bot2's state is still ENDED
         self.bot2.refresh_from_db()

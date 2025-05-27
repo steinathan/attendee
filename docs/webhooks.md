@@ -78,7 +78,7 @@ Here are some code examples for processing webhooks in different languages.
 
 ### Python
 
-This is a simple flash server that runs on port 5005. It listens for webhook requests and verifies the signature.
+This is a simple flask server that runs on port 5005. It listens for webhook requests and verifies the signature.
 ```python
 import json
 import logging
