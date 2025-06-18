@@ -14,7 +14,8 @@ from django.urls import reverse
 from django.views import View
 from django.views.generic.list import ListView
 
-from .bots_api_utils import BotCreationSource, create_bot, launch_bot
+from .bots_api_utils import BotCreationSource, create_bot
+from .launch_bot_utils import launch_bot
 from .models import (
     ApiKey,
     Bot,
@@ -161,6 +162,11 @@ class CreateCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
 
                 if not all(credentials_data.values()):
                     return HttpResponse("Missing required credentials data", status=400)
+            elif credential_type == Credentials.CredentialTypes.ASSEMBLY_AI:
+                credentials_data = {"api_key": request.POST.get("api_key")}
+
+                if not all(credentials_data.values()):
+                    return HttpResponse("Missing required credentials data", status=400)
             elif credential_type == Credentials.CredentialTypes.GOOGLE_TTS:
                 credentials_data = {"service_account_json": request.POST.get("service_account_json")}
 
@@ -184,6 +190,8 @@ class CreateCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                 return render(request, "projects/partials/gladia_credentials.html", context)
             elif credential.credential_type == Credentials.CredentialTypes.OPENAI:
                 return render(request, "projects/partials/openai_credentials.html", context)
+            elif credential.credential_type == Credentials.CredentialTypes.ASSEMBLY_AI:
+                return render(request, "projects/partials/assembly_ai_credentials.html", context)
             elif credential.credential_type == Credentials.CredentialTypes.GOOGLE_TTS:
                 return render(request, "projects/partials/google_tts_credentials.html", context)
             else:
@@ -208,6 +216,8 @@ class ProjectCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
 
         google_tts_credentials = Credentials.objects.filter(project=project, credential_type=Credentials.CredentialTypes.GOOGLE_TTS).first()
 
+        assembly_ai_credentials = Credentials.objects.filter(project=project, credential_type=Credentials.CredentialTypes.ASSEMBLY_AI).first()
+
         context = self.get_project_context(object_id, project)
         context.update(
             {
@@ -221,6 +231,8 @@ class ProjectCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                 "gladia_credential_type": Credentials.CredentialTypes.GLADIA,
                 "openai_credentials": openai_credentials.get_credentials() if openai_credentials else None,
                 "openai_credential_type": Credentials.CredentialTypes.OPENAI,
+                "assembly_ai_credentials": assembly_ai_credentials.get_credentials() if assembly_ai_credentials else None,
+                "assembly_ai_credential_type": Credentials.CredentialTypes.ASSEMBLY_AI,
             }
         )
 
@@ -522,7 +534,9 @@ class CreateBotView(LoginRequiredMixin, ProjectUrlContextMixin, View):
             if error:
                 return HttpResponse(json.dumps(error), status=400)
 
-            launch_bot(bot)
+            # If this is a scheduled bot, we don't want to launch it yet.
+            if bot.state == BotStates.JOINING:
+                launch_bot(bot)
 
             return HttpResponse("ok", status=200)
         except Exception as e:

@@ -9,13 +9,16 @@ from django.db import connection
 from django.test import override_settings
 from django.test.testcases import TransactionTestCase
 
+from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.bot_controller import BotController
-from bots.bot_controller.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.bot_controller.file_uploader import FileUploader
 from bots.bot_controller.pipeline_configuration import PipelineConfiguration
 from bots.bots_api_views import send_sync_command
 from bots.models import (
     Bot,
+    BotChatMessageRequest,
+    BotChatMessageRequestStates,
+    BotChatMessageToOptions,
     BotEventManager,
     BotEventSubTypes,
     BotEventTypes,
@@ -799,6 +802,7 @@ class TestZoomBot(TransactionTestCase):
         audio_request = None
         image_request = None
         speech_request = None
+        self.chat_message_request = None
 
         # Create a mock chat message info object
         mock_chat_msg_info = MagicMock()
@@ -898,6 +902,18 @@ class TestZoomBot(TransactionTestCase):
             # Sleep to give audio output manager time to play the speech audio
             time.sleep(2.0)
 
+            # Create chat message request
+            self.chat_message_request = BotChatMessageRequest.objects.create(
+                bot=self.bot,
+                message="Hello from the bot!",
+                to=BotChatMessageToOptions.EVERYONE,
+            )
+
+            send_sync_command(self.bot, "sync_chat_message_requests")
+
+            # Sleep to give the bot time to send the chat message
+            time.sleep(1.0)
+
             # Simulate chat message received
             adapter.on_chat_msg_notification_callback(mock_chat_msg_info, mock_chat_msg_info.GetContent())
 
@@ -913,7 +929,7 @@ class TestZoomBot(TransactionTestCase):
         threading.Timer(3, simulate_join_flow).start()
 
         # Give the bot some time to process
-        bot_thread.join(timeout=10)
+        bot_thread.join(timeout=11)
 
         # Verify that we received some data
         self.assertGreater(len(uploaded_data), 100, "Uploaded data length is not correct")
@@ -1024,6 +1040,10 @@ class TestZoomBot(TransactionTestCase):
         self.assertEqual(chat_message.participant.full_name, "Test User")
         self.assertEqual(chat_message.source_uuid, "test_chat_message_id_001")
         self.assertEqual(chat_message.to, ChatMessageToOptions.ONLY_BOT)
+
+        # Verify chat message request was processed
+        self.chat_message_request.refresh_from_db()
+        self.assertEqual(self.chat_message_request.state, BotChatMessageRequestStates.SENT)
 
         # Verify the bot adapter received the media
         controller.adapter.audio_raw_data_sender.send.assert_has_calls(
@@ -2386,6 +2406,283 @@ class TestZoomBot(TransactionTestCase):
 
         # Cleanup
         controller.cleanup()
+        bot_thread.join(timeout=5)
+
+        # Close the database connection since we're in a thread
+        connection.close()
+
+    @patch(
+        "bots.zoom_bot_adapter.video_input_manager.zoom",
+        new_callable=create_mock_zoom_sdk,
+    )
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.zoom", new_callable=create_mock_zoom_sdk)
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.jwt")
+    @patch("bots.bot_controller.bot_controller.FileUploader")
+    @patch("deepgram.DeepgramClient")
+    def test_bot_can_join_meeting_and_record_audio_in_mp3_format(
+        self,
+        MockDeepgramClient,
+        MockFileUploader,
+        mock_jwt,
+        mock_zoom_sdk_adapter,
+        mock_zoom_sdk_video,
+    ):
+        self.bot.settings = {
+            "recording_settings": {
+                "format": RecordingFormats.MP3,
+            }
+        }
+        self.bot.save()
+
+        # Set up Deepgram mock
+        MockDeepgramClient.return_value = create_mock_deepgram()
+
+        # Store uploaded data for verification
+        uploaded_data = bytearray()
+
+        # Configure the mock uploader to capture uploaded data
+        mock_uploader = create_mock_file_uploader()
+
+        def capture_upload_part(file_path):
+            with open(file_path, "rb") as f:
+                uploaded_data.extend(f.read())
+
+        mock_uploader.upload_file.side_effect = capture_upload_part
+        MockFileUploader.return_value = mock_uploader
+
+        # Mock the JWT token generation
+        mock_jwt.encode.return_value = "fake_jwt_token"
+
+        # Create bot controller
+        controller = BotController(self.bot.id)
+
+        # Run the bot in a separate thread since it has an event loop
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        def simulate_join_flow():
+            adapter = controller.adapter
+            # Simulate successful auth
+            adapter.auth_event.onAuthenticationReturnCallback(mock_zoom_sdk_adapter.AUTHRET_SUCCESS)
+
+            # Simulate connecting
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_CONNECTING,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            # Simulate successful join
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_INMEETING,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            # Wait for the gstreamer pipeline to be set up
+            time.sleep(2)
+
+            # Simulate audio frame received
+            adapter.audio_source.onOneWayAudioRawDataReceivedCallback(
+                MockPCMAudioFrame(),
+                2,  # Simulated participant ID that's not the bot
+            )
+            adapter.audio_source.onMixedAudioRawDataReceivedCallback(MockPCMAudioFrame())
+
+            # simulate audio mic initialized
+            adapter.virtual_audio_mic_event_passthrough.onMicInitializeCallback(MagicMock())
+
+            # simulate audio mic started
+            adapter.virtual_audio_mic_event_passthrough.onMicStartSendCallback()
+
+            # sleep a bit for the audio to be processed
+            time.sleep(3)
+
+            # Simulate meeting ended
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_ENDED,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            connection.close()
+
+        # Run join flow simulation after a short delay
+        threading.Timer(3, simulate_join_flow).start()
+
+        # Give the bot some time to process
+        bot_thread.join(timeout=11)
+
+        # Verify that we received some data
+        self.assertGreater(len(uploaded_data), 100, "Uploaded data length is not correct")
+
+        # Check for FLAC file signature
+        flac_signature_found = b"fLaC" in uploaded_data[:1000]
+        self.assertTrue(flac_signature_found, "FLAC signature not found in uploaded data")
+
+        # Additional verification for FileUploader
+        mock_uploader.upload_file.assert_called()
+        self.assertGreater(mock_uploader.upload_file.call_count, 0, "upload_file was never called")
+        mock_uploader.wait_for_upload.assert_called_once()
+        mock_uploader.delete_file.assert_called_once()
+
+        # Refresh the bot from the database
+        self.bot.refresh_from_db()
+
+        # Assert that the heartbeat timestamp was set
+        self.assertIsNotNone(self.bot.first_heartbeat_timestamp)
+        self.assertIsNotNone(self.bot.last_heartbeat_timestamp)
+
+        # Assert that the bot is in the ENDED state
+        self.assertEqual(self.bot.state, BotStates.ENDED)
+
+        # Verify all bot events in sequence
+        bot_events = self.bot.bot_events.all()
+        self.assertEqual(len(bot_events), 5)  # We expect 5 events in total
+
+        # Verify join_requested_event (Event 1)
+        join_requested_event = bot_events[0]
+        self.assertEqual(join_requested_event.event_type, BotEventTypes.JOIN_REQUESTED)
+
+        # Verify bot_joined_meeting_event (Event 2)
+        bot_joined_meeting_event = bot_events[1]
+        self.assertEqual(bot_joined_meeting_event.event_type, BotEventTypes.BOT_JOINED_MEETING)
+
+        # Verify recording_permission_granted_event (Event 3)
+        recording_permission_granted_event = bot_events[2]
+        self.assertEqual(
+            recording_permission_granted_event.event_type,
+            BotEventTypes.BOT_RECORDING_PERMISSION_GRANTED,
+        )
+
+        # Verify meeting_ended_event (Event 4)
+        meeting_ended_event = bot_events[3]
+        self.assertEqual(meeting_ended_event.event_type, BotEventTypes.MEETING_ENDED)
+
+        # Verify post_processing_completed_event (Event 5)
+        post_processing_completed_event = bot_events[4]
+        self.assertEqual(post_processing_completed_event.event_type, BotEventTypes.POST_PROCESSING_COMPLETED)
+
+        # Verify expected SDK calls
+        mock_zoom_sdk_adapter.InitSDK.assert_called_once()
+        mock_zoom_sdk_adapter.CreateMeetingService.assert_called_once()
+        mock_zoom_sdk_adapter.CreateAuthService.assert_called_once()
+        controller.adapter.meeting_service.Join.assert_called_once()
+
+        # Verify that the recording was finished
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.state, RecordingStates.COMPLETE)
+        self.assertEqual(self.recording.transcription_state, RecordingTranscriptionStates.COMPLETE)
+
+        # Verify that the recording has an utterance
+        utterance = self.recording.utterances.filter(failure_data__isnull=True).first()
+        self.assertEqual(self.recording.utterances.count(), 1)
+        self.assertIsNotNone(utterance.transcription)
+
+        # Cleanup
+        controller.cleanup()
+        bot_thread.join(timeout=5)
+
+        # Close the database connection since we're in a thread
+        connection.close()
+
+    @patch(
+        "bots.zoom_bot_adapter.video_input_manager.zoom",
+        new_callable=create_mock_zoom_sdk,
+    )
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.zoom", new_callable=create_mock_zoom_sdk)
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.jwt")
+    @patch("bots.bot_controller.bot_controller.FileUploader")
+    def test_scheduled_bot_transitions_from_staged_to_joining_at_join_time(
+        self,
+        MockFileUploader,
+        mock_jwt,
+        mock_zoom_sdk_adapter,
+        mock_zoom_sdk_video,
+    ):
+        from datetime import timedelta
+
+        from django.utils import timezone as django_timezone
+
+        # Configure the mock uploader
+        mock_uploader = create_mock_file_uploader()
+        MockFileUploader.return_value = mock_uploader
+
+        # Mock the JWT token generation
+        mock_jwt.encode.return_value = "fake_jwt_token"
+
+        # Set the bot to SCHEDULED state and set a join_at time in the past
+        # This way we can test that the bot transitions when the time condition is met
+        join_time = django_timezone.now() + timedelta(seconds=5)  # 5 seconds from now
+        self.bot.state = BotStates.SCHEDULED
+        self.bot.join_at = join_time
+        self.bot.save()
+
+        # Clear the old joined event added by the setup code
+        self.bot.bot_events.all().delete()
+
+        # Transition the bot to STAGED state (simulating what the scheduler task would do)
+        BotEventManager.create_event(bot=self.bot, event_type=BotEventTypes.STAGED, event_metadata={"join_at": join_time.isoformat()})
+
+        # Verify bot is in STAGED state
+        self.bot.refresh_from_db()
+        self.assertEqual(self.bot.state, BotStates.STAGED)
+
+        # Create bot controller
+        controller = BotController(self.bot.id)
+
+        # Run the bot in a separate thread since it has an event loop
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        def wait_for_transition():
+            # Wait for the join time to pass and for the bot to process the time change
+            time.sleep(8)  # Wait longer than the join_time (5 seconds) plus processing time
+
+            # Refresh bot and check if it transitioned to JOINING
+            self.bot.refresh_from_db()
+            # Bot should now be in JOINING state since join time has passed
+            self.assertEqual(self.bot.state, BotStates.JOINING)
+
+            # Clean up - we don't need to test the actual joining process, just the transition
+            controller.cleanup()
+
+            # Clean up connections in thread
+            connection.close()
+
+        # Run simulation after a short delay to let the bot controller start
+        threading.Timer(2, wait_for_transition).start()
+
+        # Give the bot some time to process
+        bot_thread.join(timeout=15)
+
+        # Refresh the bot from the database one final time
+        self.bot.refresh_from_db()
+
+        # Verify that the bot is now in JOINING state
+        self.assertEqual(self.bot.state, BotStates.JOINING)
+
+        # Verify the events were created correctly
+        bot_events = self.bot.bot_events.all()
+        self.assertEqual(len(bot_events), 2)  # STAGED and JOIN_REQUESTED events
+
+        # Verify STAGED event
+        staged_event = bot_events[0]
+        self.assertEqual(staged_event.event_type, BotEventTypes.STAGED)
+        self.assertEqual(staged_event.old_state, BotStates.SCHEDULED)
+        self.assertEqual(staged_event.new_state, BotStates.STAGED)
+        self.assertEqual(staged_event.metadata.get("join_at"), join_time.isoformat())
+
+        # Verify JOIN_REQUESTED event
+        join_requested_event = bot_events[1]
+        self.assertEqual(join_requested_event.event_type, BotEventTypes.JOIN_REQUESTED)
+        self.assertEqual(join_requested_event.old_state, BotStates.STAGED)
+        self.assertEqual(join_requested_event.new_state, BotStates.JOINING)
+        # Verify it was triggered by the scheduler
+        from bots.bots_api_utils import BotCreationSource
+
+        self.assertEqual(join_requested_event.metadata.get("source"), BotCreationSource.SCHEDULER)
+
+        # Cleanup
         bot_thread.join(timeout=5)
 
         # Close the database connection since we're in a thread

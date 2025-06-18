@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+
 @dataclass(frozen=True)
 class AutomaticLeaveConfiguration:
     """Specifies conditions under which the bot will automatically leave a meeting.

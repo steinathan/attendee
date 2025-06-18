@@ -3,6 +3,7 @@ import json
 from dataclasses import asdict
 
 import jsonschema
+from django.utils import timezone
 from drf_spectacular.utils import (
     OpenApiExample,
     extend_schema_field,
@@ -10,9 +11,10 @@ from drf_spectacular.utils import (
 )
 from rest_framework import serializers
 
-from .bot_controller.automatic_leave_configuration import AutomaticLeaveConfiguration
+from .automatic_leave_configuration import AutomaticLeaveConfiguration
 from .models import (
     Bot,
+    BotChatMessageToOptions,
     BotEventSubTypes,
     BotEventTypes,
     BotStates,
@@ -108,6 +110,20 @@ class BotImageSerializer(serializers.Serializer):
                         "type": "string",
                         "description": "The URL to send the transcriptions to. If used, the transcriptions will be sent directly from Deepgram to your server so you will not be able to access them via the Attendee API. See here for details: https://developers.deepgram.com/docs/callback",
                     },
+                    "keyterms": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Improve recall of key terms or phrases in the transcript. This feature is only available for the nova-3 model in english, so you must set the language to 'en'. See here for details: https://developers.deepgram.com/docs/keyterm",
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Improve recall of key terms or phrases in the transcript. This feature is only available for the nova-2 model. See here for details: https://developers.deepgram.com/docs/keywords",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "The model to use for transcription. Defaults to 'nova-3' if not specified, which is the recommended model for most use cases. See here for details: https://developers.deepgram.com/docs/models-languages-overview",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -130,6 +146,10 @@ class BotImageSerializer(serializers.Serializer):
                         "type": "string",
                         "description": "The language code for Google Meet closed captions (e.g. 'en-US'). See here for available languages and codes: https://docs.google.com/spreadsheets/d/1MN44lRrEBaosmVI9rtTzKMii86zGgDwEwg4LSj-SjiE",
                     },
+                    "teams_language": {
+                        "type": "string",
+                        "description": "The language code for Teams closed captions (e.g. 'en-us'). This will change the closed captions language for everyone in the meeting, not just the bot. See here for available languages and codes: https://docs.google.com/spreadsheets/d/1F-1iLJ_4btUZJkZcD2m5sF3loqGbB0vTzgOubwQTb5o/edit?usp=sharing",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -145,8 +165,20 @@ class BotImageSerializer(serializers.Serializer):
                         "type": "string",
                         "description": "Optional prompt to use for the OpenAI transcription",
                     },
+                    "language": {
+                        "type": "string",
+                        "description": "The language to use for transcription. See here in the 'Set 1' column for available language codes: https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes. This parameter is optional but if you know the language in advance, setting it will improve accuracy.",
+                    },
                 },
                 "required": ["model"],
+                "additionalProperties": False,
+            },
+            "assembly_ai": {
+                "type": "object",
+                "properties": {
+                    "language_code": {"type": "string", "description": "The language code to use for transcription. See here for available languages: https://www.assemblyai.com/docs/speech-to-text/pre-recorded-audio/supported-languages"},
+                    "language_detection": {"type": "boolean", "description": "Whether to automatically detect the spoken language."},
+                },
                 "additionalProperties": False,
             },
         },
@@ -183,7 +215,7 @@ class RTMPSettingsJSONField(serializers.JSONField):
         "properties": {
             "format": {
                 "type": "string",
-                "description": "The format of the recording to save. The supported formats are 'mp4'.",
+                "description": "The format of the recording to save. The supported formats are 'mp4' and 'mp3'.",
             },
             "view": {
                 "type": "string",
@@ -269,6 +301,48 @@ class AutomaticLeaveSettingsJSONField(serializers.JSONField):
 @extend_schema_serializer(
     examples=[
         OpenApiExample(
+            "Chat message",
+            value={
+                "to": "everyone",
+                "message": "Hello everyone, I'm here to record and summarize this meeting.",
+            },
+            description="An example of a chat message to send to everyone in the meeting",
+        ),
+        OpenApiExample(
+            "Chat message to specific user",
+            value={
+                "to": "specific_user",
+                "to_user_uuid": "123e4567-e89b-12d3-a456-426614174000",
+                "message": "Hello Bob, I'm here to record and summarize this meeting.",
+            },
+            description="An example of a chat message to send to a specific user in the meeting",
+        ),
+    ]
+)
+class BotChatMessageRequestSerializer(serializers.Serializer):
+    to_user_uuid = serializers.CharField(
+        max_length=255,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text="The UUID of the user to send the message to. Required if 'to' is 'specific_user'.",
+    )
+    to = serializers.ChoiceField(choices=BotChatMessageToOptions.values, help_text="Who to send the message to.", default=BotChatMessageToOptions.EVERYONE)
+    message = serializers.CharField(help_text="The message text to send.")
+
+    def validate(self, data):
+        to_value = data.get("to")
+        to_user_uuid = data.get("to_user_uuid")
+
+        if to_value == BotChatMessageToOptions.SPECIFIC_USER and not to_user_uuid:
+            raise serializers.ValidationError({"to_user_uuid": "This field is required when sending to a specific user."})
+
+        return data
+
+
+@extend_schema_serializer(
+    examples=[
+        OpenApiExample(
             "Valid meeting URL",
             value={
                 "meeting_url": "https://zoom.us/j/123?pwd=456",
@@ -283,6 +357,8 @@ class CreateBotSerializer(serializers.Serializer):
     bot_name = serializers.CharField(help_text="The name of the bot to create, e.g. 'My Bot'")
     bot_image = BotImageSerializer(help_text="The image for the bot", required=False, default=None)
     metadata = MetadataJSONField(help_text="JSON object containing metadata to associate with the bot", required=False, default=None)
+    bot_chat_message = BotChatMessageRequestSerializer(help_text="The chat message the bot sends after it joins the meeting", required=False, default=None)
+    join_at = serializers.DateTimeField(help_text="The time the bot should join the meeting. ISO 8601 format, e.g. 2025-06-13T12:00:00Z", required=False, default=None)
 
     transcription_settings = TranscriptionSettingsJSONField(
         help_text="The transcription settings for the bot, e.g. {'deepgram': {'language': 'en'}}",
@@ -301,6 +377,9 @@ class CreateBotSerializer(serializers.Serializer):
                     },
                     "detect_language": {"type": "boolean"},
                     "callback": {"type": "string"},
+                    "keyterms": {"type": "array", "items": {"type": "string"}},
+                    "keywords": {"type": "array", "items": {"type": "string"}},
+                    "model": {"type": "string"},
                 },
                 "additionalProperties": False,
             },
@@ -325,14 +404,31 @@ class CreateBotSerializer(serializers.Serializer):
                         "type": "string",
                         "description": "Optional prompt to use for the OpenAI transcription",
                     },
+                    "language": {
+                        "type": "string",
+                        "description": "The language to use for transcription. See here in the 'Set 1' column for available language codes: https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes. This parameter is optional but if you know the language in advance, setting it will improve accuracy.",
+                    },
                 },
                 "required": ["model"],
+                "additionalProperties": False,
+            },
+            "assembly_ai": {
+                "type": "object",
+                "properties": {
+                    "language_code": {"type": "string"},
+                    "language_detection": {"type": "boolean"},
+                },
+                "required": [],
                 "additionalProperties": False,
             },
             "meeting_closed_captions": {
                 "type": "object",
                 "properties": {
                     "google_meet_language": {"type": "string"},
+                    "teams_language": {
+                        "type": "string",
+                        "enum": ["ar-sa", "ar-ae", "bg-bg", "ca-es", "zh-cn", "zh-hk", "zh-tw", "hr-hr", "cs-cz", "da-dk", "nl-be", "nl-nl", "en-au", "en-ca", "en-in", "en-nz", "en-gb", "en-us", "et-ee", "fi-fi", "fr-ca", "fr-fr", "de-de", "de-ch", "el-gr", "he-il", "hi-in", "hu-hu", "id-id", "it-it", "ja-jp", "ko-kr", "lv-lv", "lt-lt", "nb-no", "pl-pl", "pt-br", "pt-pt", "ro-ro", "ru-ru", "sr-rs", "sk-sk", "sl-si", "es-mx", "es-es", "sv-se", "th-th", "tr-tr", "uk-ua", "vi-vn", "cy-gb"],
+                    },
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -459,8 +555,8 @@ class CreateBotSerializer(serializers.Serializer):
 
         # Validate format if provided
         format = value.get("format")
-        if format not in [RecordingFormats.MP4, None]:
-            raise serializers.ValidationError({"format": "Format must be mp4"})
+        if format not in [RecordingFormats.MP4, RecordingFormats.MP3, None]:
+            raise serializers.ValidationError({"format": "Format must be mp4 or mp3"})
 
         # Validate view if provided
         view = value.get("view")
@@ -551,6 +647,16 @@ class CreateBotSerializer(serializers.Serializer):
                 raise serializers.ValidationError("Bot name cannot contain emojis or rare script characters.")
         return value
 
+    def validate_join_at(self, value):
+        """Validate that join_at cannot be in the past."""
+        if value is None:
+            return value
+
+        if value < timezone.now():
+            raise serializers.ValidationError("join_at cannot be in the past")
+
+        return value
+
 
 class BotSerializer(serializers.ModelSerializer):
     id = serializers.CharField(source="object_id")
@@ -559,6 +665,7 @@ class BotSerializer(serializers.ModelSerializer):
     events = serializers.SerializerMethodField()
     transcription_state = serializers.SerializerMethodField()
     recording_state = serializers.SerializerMethodField()
+    join_at = serializers.DateTimeField()
 
     @extend_schema_field(
         {
@@ -634,6 +741,7 @@ class BotSerializer(serializers.ModelSerializer):
             "events",
             "transcription_state",
             "recording_state",
+            "join_at",
         ]
         read_only_fields = fields
 
@@ -753,3 +861,28 @@ class ChatMessageSerializer(serializers.Serializer):
 
     def get_to(self, obj):
         return ChatMessageToOptions.choices[obj.to - 1][1]
+
+
+@extend_schema_serializer(
+    examples=[
+        OpenApiExample(
+            "Update join_at",
+            value={
+                "join_at": "2025-06-13T12:00:00Z",
+            },
+            description="Example of updating the join_at time for a scheduled bot",
+        )
+    ]
+)
+class PatchBotSerializer(serializers.Serializer):
+    join_at = serializers.DateTimeField(help_text="The time the bot should join the meeting. ISO 8601 format, e.g. 2025-06-13T12:00:00Z", required=False)
+
+    def validate_join_at(self, value):
+        """Validate that join_at cannot be in the past."""
+        if value is None:
+            return value
+
+        if value < timezone.now():
+            raise serializers.ValidationError("join_at cannot be in the past")
+
+        return value

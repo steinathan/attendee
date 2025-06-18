@@ -32,6 +32,10 @@ from bots.models import (
     TranscriptionProviders,
     TranscriptionTypes,
     Utterance,
+    WebhookDeliveryAttempt,
+    WebhookSecret,
+    WebhookSubscription,
+    WebhookTriggerTypes,
 )
 from bots.web_bot_adapter.ui_methods import UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiRetryableException
 
@@ -102,6 +106,9 @@ class TestGoogleMeetBot(TransactionTestCase):
         self.deepgram_credentials = Credentials.objects.create(project=self.project, credential_type=Credentials.CredentialTypes.DEEPGRAM)
         self.deepgram_credentials.set_credentials({"api_key": "test_api_key"})
 
+        # Create webhook subscription for transcript updates
+        self.webhook_secret = WebhookSecret.objects.create(project=self.project)
+
         # Configure Celery to run tasks eagerly (synchronously)
         from django.conf import settings
 
@@ -116,8 +123,10 @@ class TestGoogleMeetBot(TransactionTestCase):
     @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.wait_for_host_if_needed", return_value=None)
     @patch("deepgram.DeepgramClient")
     @patch("time.time")
+    @patch("bots.tasks.deliver_webhook_task.deliver_webhook")
     def test_bot_can_join_meeting_and_record_audio_with_deepgram_transcription(
         self,
+        mock_deliver_webhook,
         mock_time,
         MockDeepgramClient,
         mock_wait_for_host_if_needed,
@@ -127,6 +136,15 @@ class TestGoogleMeetBot(TransactionTestCase):
         MockDisplay,
         mock_create_debug_recording,
     ):
+        mock_deliver_webhook.return_value = None
+
+        self.webhook_subscription = WebhookSubscription.objects.create(
+            project=self.project,
+            url="https://example.com/webhook",
+            triggers=[WebhookTriggerTypes.BOT_STATE_CHANGE, WebhookTriggerTypes.TRANSCRIPT_UPDATE],
+            is_active=True,
+        )
+
         # Set initial time
         current_time = 1000.0
         mock_time.return_value = current_time
@@ -295,6 +313,20 @@ class TestGoogleMeetBot(TransactionTestCase):
         audio_utterance = utterances.filter(source=Utterance.Sources.PER_PARTICIPANT_AUDIO, failure_data__isnull=True).first()
         self.assertIsNotNone(audio_utterance)
         self.assertEqual(audio_utterance.transcription.get("transcript"), "This is a test transcription from Deepgram")
+
+        # Verify webhook delivery attempts were created for transcript updates
+        webhook_delivery_attempts = WebhookDeliveryAttempt.objects.filter(bot=self.bot, webhook_trigger_type=WebhookTriggerTypes.TRANSCRIPT_UPDATE)
+        self.assertGreater(webhook_delivery_attempts.count(), 0, "Expected webhook delivery attempts for transcript updates")
+
+        # Verify the webhook payload contains the expected utterance data
+        webhook_attempt = webhook_delivery_attempts.first()
+        self.assertIsNotNone(webhook_attempt.payload)
+        self.assertIn("speaker_name", webhook_attempt.payload)
+        self.assertIn("speaker_uuid", webhook_attempt.payload)
+        self.assertIn("transcription", webhook_attempt.payload)
+        self.assertEqual(webhook_attempt.payload["speaker_name"], "Test User")
+        self.assertEqual(webhook_attempt.payload["speaker_uuid"], "user1")
+        self.assertIsNotNone(webhook_attempt.payload["transcription"])
 
         # Verify WebSocket media sending was enabled and performance.timeOrigin was queried
         mock_driver.execute_script.assert_has_calls([call("window.ws?.enableMediaSending();"), call("return performance.timeOrigin;")])
@@ -634,7 +666,7 @@ class TestGoogleMeetBot(TransactionTestCase):
             controller.adapter.participants_info["user1"] = {"deviceId": "user1", "fullName": "Test User", "active": True}
 
             # Simulate caption data arrival
-            caption_data = {"captionId": "caption1", "deviceId": "user1", "text": "This is a test caption"}
+            caption_data = {"captionId": "caption1", "deviceId": "user1", "text": "This is a test caption", "isFinal": 1}
             controller.closed_caption_manager.upsert_caption(caption_data)
 
             # Process these events
@@ -724,6 +756,10 @@ class TestGoogleMeetBot(TransactionTestCase):
         caption_utterance = utterances.filter(source=Utterance.Sources.CLOSED_CAPTION_FROM_PLATFORM).first()
         self.assertIsNotNone(caption_utterance)
         self.assertEqual(caption_utterance.transcription.get("transcript"), "This is a test caption")
+
+        # Verify webhook delivery attempts were created for transcript updates
+        webhook_delivery_attempts = WebhookDeliveryAttempt.objects.filter(bot=self.bot, webhook_trigger_type=WebhookTriggerTypes.TRANSCRIPT_UPDATE)
+        self.assertEqual(webhook_delivery_attempts.count(), 0, "Expected zero webhook delivery attempts for transcript updates")
 
         # Verify WebSocket media sending was enabled and performance.timeOrigin was queried
         mock_driver.execute_script.assert_has_calls([call("window.ws?.enableMediaSending();"), call("return performance.timeOrigin;")])
@@ -942,6 +978,93 @@ class TestGoogleMeetBot(TransactionTestCase):
         fatal_error_event = self.bot.bot_events.filter(event_type=BotEventTypes.FATAL_ERROR, event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED).first()
         self.assertIsNone(fatal_error_event)
 
+    @patch("kubernetes.client.CoreV1Api")
+    @patch("kubernetes.config.load_incluster_config")
+    @patch("kubernetes.config.load_kube_config")
+    def test_scheduled_bot_with_future_join_at_not_terminated(self, mock_load_kube_config, mock_load_incluster_config, MockCoreV1Api):
+        # Set up mock Kubernetes API
+        mock_k8s_api = MagicMock()
+        MockCoreV1Api.return_value = mock_k8s_api
+
+        # Set up config.load_incluster_config to raise ConfigException so load_kube_config gets called
+        mock_load_incluster_config.side_effect = kubernetes.config.config_exception.ConfigException("Mock ConfigException")
+
+        # Create a scheduled bot that was created 5 days ago but has join_at in the future
+        five_days_ago = timezone.now() - timezone.timedelta(days=5)
+        one_hour_from_now = timezone.now() + timezone.timedelta(hours=1)
+
+        self.bot.created_at = five_days_ago
+        self.bot.join_at = one_hour_from_now  # Future join time
+        self.bot.first_heartbeat_timestamp = None
+        self.bot.last_heartbeat_timestamp = None
+        self.bot.state = BotStates.SCHEDULED  # Set to scheduled state
+        self.bot.save()
+
+        # Set bot launch method to kubernetes
+        with patch.dict(os.environ, {"LAUNCH_BOT_METHOD": "kubernetes"}):
+            # Import and run the command
+            from bots.management.commands.clean_up_bots_with_heartbeat_timeout_or_that_never_launched import Command
+
+            command = Command()
+            command.handle()
+
+        # Refresh the bot state from the database
+        self.bot.refresh_from_db()
+
+        # Verify the bot was NOT moved to FATAL_ERROR state since join_at is in the future
+        self.assertEqual(self.bot.state, BotStates.SCHEDULED)
+
+        # Verify that no FATAL_ERROR event was created for a bot that never launched
+        fatal_error_event = self.bot.bot_events.filter(event_type=BotEventTypes.FATAL_ERROR, event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED).first()
+        self.assertIsNone(fatal_error_event)
+
+        # Verify that no pod deletion was attempted
+        mock_k8s_api.delete_namespaced_pod.assert_not_called()
+
+    @patch("kubernetes.client.CoreV1Api")
+    @patch("kubernetes.config.load_incluster_config")
+    @patch("kubernetes.config.load_kube_config")
+    def test_scheduled_bot_with_past_join_at_terminated(self, mock_load_kube_config, mock_load_incluster_config, MockCoreV1Api):
+        # Set up mock Kubernetes API
+        mock_k8s_api = MagicMock()
+        MockCoreV1Api.return_value = mock_k8s_api
+
+        # Set up config.load_incluster_config to raise ConfigException so load_kube_config gets called
+        mock_load_incluster_config.side_effect = kubernetes.config.config_exception.ConfigException("Mock ConfigException")
+
+        # Create a scheduled bot with join_at in the past (2 days ago) but never launched
+        two_days_ago = timezone.now() - timezone.timedelta(days=2)
+
+        self.bot.join_at = two_days_ago  # Past join time
+        self.bot.first_heartbeat_timestamp = None
+        self.bot.last_heartbeat_timestamp = None
+        self.bot.state = BotStates.SCHEDULED  # Set to scheduled state
+        self.bot.save()
+
+        # Set bot launch method to kubernetes
+        with patch.dict(os.environ, {"LAUNCH_BOT_METHOD": "kubernetes"}):
+            # Import and run the command
+            from bots.management.commands.clean_up_bots_with_heartbeat_timeout_or_that_never_launched import Command
+
+            command = Command()
+            command.handle()
+
+        # Refresh the bot state from the database
+        self.bot.refresh_from_db()
+
+        # Verify the bot was moved to FATAL_ERROR state since join_at was in the past and it never launched
+        self.assertEqual(self.bot.state, BotStates.FATAL_ERROR)
+
+        # Verify that a FATAL_ERROR event was created with the correct sub type
+        fatal_error_event = self.bot.bot_events.filter(event_type=BotEventTypes.FATAL_ERROR, event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED).first()
+        self.assertIsNotNone(fatal_error_event)
+        self.assertEqual(fatal_error_event.old_state, BotStates.SCHEDULED)
+        self.assertEqual(fatal_error_event.new_state, BotStates.FATAL_ERROR)
+
+        # Verify Kubernetes pod deletion was attempted with the correct pod name
+        pod_name = self.bot.k8s_pod_name()
+        mock_k8s_api.delete_namespaced_pod.assert_called_once_with(name=pod_name, namespace="attendee", grace_period_seconds=0)
+
     @patch("bots.models.Bot.create_debug_recording", return_value=False)
     @patch("bots.web_bot_adapter.web_bot_adapter.Display")
     @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")
@@ -949,8 +1072,10 @@ class TestGoogleMeetBot(TransactionTestCase):
     @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.check_if_meeting_is_found", return_value=None)
     @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.wait_for_host_if_needed", return_value=None)
     @patch("time.time")
+    @patch("bots.tasks.deliver_webhook_task.deliver_webhook")
     def test_bot_can_join_meeting_and_record_with_closed_caption_transcription(
         self,
+        mock_deliver_webhook,
         mock_time,
         mock_wait_for_host_if_needed,
         mock_check_if_meeting_is_found,
@@ -959,6 +1084,15 @@ class TestGoogleMeetBot(TransactionTestCase):
         MockDisplay,
         mock_create_debug_recording,
     ):
+        mock_deliver_webhook.return_value = None
+
+        self.webhook_subscription = WebhookSubscription.objects.create(
+            project=self.project,
+            url="https://example.com/webhook",
+            triggers=[WebhookTriggerTypes.BOT_STATE_CHANGE, WebhookTriggerTypes.TRANSCRIPT_UPDATE],
+            is_active=True,
+        )
+
         # Set initial time
         current_time = 1000.0
         mock_time.return_value = current_time
@@ -1002,7 +1136,7 @@ class TestGoogleMeetBot(TransactionTestCase):
             controller.adapter.participants_info["user1"] = {"deviceId": "user1", "fullName": "Test User", "active": True}
 
             # Simulate caption data arrival
-            caption_data = {"captionId": "caption1", "deviceId": "user1", "text": "This is a test caption from closed captions"}
+            caption_data = {"captionId": "caption1", "deviceId": "user1", "text": "This is a test caption from closed captions", "isFinal": 1}
             controller.closed_caption_manager.upsert_caption(caption_data)
 
             # Force caption processing by flushing
@@ -1101,6 +1235,20 @@ class TestGoogleMeetBot(TransactionTestCase):
         self.assertIsNotNone(caption_utterance)
         self.assertEqual(caption_utterance.transcription.get("transcript"), "This is a test caption from closed captions")
 
+        # Verify webhook delivery attempts were created for transcript updates
+        webhook_delivery_attempts = WebhookDeliveryAttempt.objects.filter(bot=self.bot, webhook_trigger_type=WebhookTriggerTypes.TRANSCRIPT_UPDATE)
+        self.assertGreater(webhook_delivery_attempts.count(), 0, "Expected webhook delivery attempts for transcript updates")
+
+        # Verify the webhook payload contains the expected utterance data
+        webhook_attempt = webhook_delivery_attempts.first()
+        self.assertIsNotNone(webhook_attempt.payload)
+        self.assertIn("speaker_name", webhook_attempt.payload)
+        self.assertIn("speaker_uuid", webhook_attempt.payload)
+        self.assertIn("transcription", webhook_attempt.payload)
+        self.assertEqual(webhook_attempt.payload["speaker_name"], "Test User")
+        self.assertEqual(webhook_attempt.payload["speaker_uuid"], "user1")
+        self.assertIsNotNone(webhook_attempt.payload["transcription"])
+
         # Verify WebSocket media sending was enabled and performance.timeOrigin was queried
         mock_driver.execute_script.assert_has_calls([call("window.ws?.enableMediaSending();"), call("return performance.timeOrigin;")])
 
@@ -1109,6 +1257,288 @@ class TestGoogleMeetBot(TransactionTestCase):
         self.assertGreater(mock_uploader.upload_file.call_count, 0)
         mock_uploader.wait_for_upload.assert_called_once()
         mock_uploader.delete_file.assert_called_once()
+
+        # Cleanup
+        controller.cleanup()
+        bot_thread.join(timeout=5)
+
+        # Close the database connection since we're in a thread
+        connection.close()
+
+    @patch("bots.models.Bot.create_debug_recording", return_value=False)
+    @patch("bots.web_bot_adapter.web_bot_adapter.Display")
+    @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")
+    @patch("bots.bot_controller.bot_controller.FileUploader")
+    @patch("bots.bot_controller.bot_controller.ScreenAndAudioRecorder.start_recording", return_value=None)
+    @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.check_if_meeting_is_found", return_value=None)
+    @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.wait_for_host_if_needed", return_value=None)
+    def test_google_meet_bot_can_join_meeting_and_record_audio_in_mp3_format(
+        self,
+        mock_wait_for_host_if_needed,
+        mock_check_if_meeting_is_found,
+        mock_start_recording,
+        MockFileUploader,
+        MockChromeDriver,
+        MockDisplay,
+        mock_create_debug_recording,
+    ):
+        self.bot.settings = {
+            "recording_settings": {
+                "format": "mp3",
+            }
+        }
+        self.bot.save()
+
+        # Configure the mock uploader to capture data
+        mock_uploader = create_mock_file_uploader()
+        MockFileUploader.return_value = mock_uploader
+
+        # Mock the Chrome driver
+        mock_driver = create_mock_google_meet_driver()
+        MockChromeDriver.return_value = mock_driver
+
+        # Mock virtual display
+        mock_display = MagicMock()
+        MockDisplay.return_value = mock_display
+
+        # Create bot controller
+        controller = BotController(self.bot.id)
+
+        # Run the bot in a separate thread since it has an event loop
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        def simulate_join_flow():
+            # Sleep to allow initialization
+            time.sleep(2)
+
+            # Add participants to keep the bot in the meeting
+            controller.adapter.participants_info["user1"] = {"deviceId": "user1", "fullName": "Test User", "active": True}
+
+            # Let the bot run for a bit to "record"
+            time.sleep(3)
+
+            # Trigger auto-leave
+            controller.adapter.only_one_participant_in_meeting_at = time.time() - 10000000000
+            time.sleep(4)
+
+            # Clean up connections in thread
+            connection.close()
+
+        # Run join flow simulation after a short delay
+        threading.Timer(2, simulate_join_flow).start()
+
+        # Give the bot some time to process
+        bot_thread.join(timeout=10)
+
+        # Refresh the bot from the database
+        self.bot.refresh_from_db()
+
+        # Assert that the bot is in the ENDED state
+        self.assertEqual(self.bot.state, BotStates.ENDED)
+
+        # Verify that the recording was finished
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.state, RecordingStates.COMPLETE)
+
+        # Verify file uploader was used. This implies a file was created and handled.
+        mock_uploader.upload_file.assert_called_once()
+
+        # Cleanup
+        controller.cleanup()
+        bot_thread.join(timeout=5)
+
+        # Close the database connection since we're in a thread
+        connection.close()
+
+    @patch("bots.models.Bot.create_debug_recording", return_value=False)
+    @patch("bots.web_bot_adapter.web_bot_adapter.Display")
+    @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")
+    @patch("bots.bot_controller.bot_controller.FileUploader")
+    @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.check_if_meeting_is_found", return_value=None)
+    @patch("bots.google_meet_bot_adapter.google_meet_ui_methods.GoogleMeetUIMethods.wait_for_host_if_needed", return_value=None)
+    @patch("bots.bot_controller.screen_and_audio_recorder.ScreenAndAudioRecorder.pause_recording", return_value=True)
+    @patch("bots.bot_controller.screen_and_audio_recorder.ScreenAndAudioRecorder.resume_recording", return_value=True)
+    @patch("time.time")
+    def test_bot_can_pause_and_resume_recording_with_proper_utterance_handling(
+        self,
+        mock_time,
+        mock_pause_recording,
+        mock_resume_recording,
+        mock_wait_for_host_if_needed,
+        mock_check_if_meeting_is_found,
+        MockFileUploader,
+        MockChromeDriver,
+        MockDisplay,
+        mock_create_debug_recording,
+    ):
+        # Set initial time
+        current_time = 1000.0
+        mock_time.return_value = current_time
+
+        # Use closed captions for transcription
+        self.recording.transcription_provider = TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
+        self.recording.save()
+
+        # Configure the mock uploader
+        mock_uploader = create_mock_file_uploader()
+        MockFileUploader.return_value = mock_uploader
+
+        # Mock the Chrome driver
+        mock_driver = create_mock_google_meet_driver()
+        MockChromeDriver.return_value = mock_driver
+
+        # Mock virtual display
+        mock_display = MagicMock()
+        MockDisplay.return_value = mock_display
+
+        # Create bot controller
+        controller = BotController(self.bot.id)
+
+        # Run the bot in a separate thread since it has an event loop
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        self.original_recording_started_at = None
+
+        def simulate_pause_resume_flow():
+            nonlocal current_time
+            # Sleep to allow initialization and joining
+            time.sleep(3)
+
+            # Add participants - simulate websocket message processing
+            controller.adapter.participants_info["user1"] = {"deviceId": "user1", "fullName": "Test User", "active": True}
+
+            # Simulate receiving audio to keep bot alive
+            controller.adapter.last_audio_message_processed_time = current_time
+
+            # Wait for bot to be in recording state
+            timeout = time.time() + 10
+            while time.time() < timeout:
+                controller.bot_in_db.refresh_from_db()
+                if controller.bot_in_db.state == BotStates.JOINED_RECORDING:
+                    break
+                time.sleep(0.1)
+
+            # Verify we're in recording state
+            controller.bot_in_db.refresh_from_db()
+            self.assertEqual(controller.bot_in_db.state, BotStates.JOINED_RECORDING)
+
+            self.original_recording_started_at = controller.bot_in_db.recordings.first().started_at
+
+            # Send closed caption before pause (should create utterance)
+            # Simulate caption coming through the web bot adapter
+            caption_json_before_pause = {"type": "CaptionUpdate", "caption": {"captionId": "caption1", "deviceId": "user1", "text": "Caption before pause", "isFinal": 1}}
+            controller.adapter.handle_caption_update(caption_json_before_pause)
+
+            time.sleep(1)
+
+            # Pause recording
+            controller.pause_recording()
+
+            # Wait for pause to take effect
+            timeout = time.time() + 5
+            while time.time() < timeout:
+                controller.bot_in_db.refresh_from_db()
+                if controller.bot_in_db.state == BotStates.JOINED_RECORDING_PAUSED:
+                    break
+                time.sleep(0.1)
+
+            # Verify we're in paused state
+            controller.bot_in_db.refresh_from_db()
+            self.assertEqual(controller.bot_in_db.state, BotStates.JOINED_RECORDING_PAUSED)
+
+            # Send closed caption during pause (should NOT create utterance)
+            # Simulate caption coming through the web bot adapter - this should be ignored due to recording_paused check
+            caption_json_during_pause = {"type": "CaptionUpdate", "caption": {"captionId": "caption2", "deviceId": "user1", "text": "Caption during pause", "isFinal": 1}}
+            controller.adapter.handle_caption_update(caption_json_during_pause)
+
+            time.sleep(1)
+
+            # Resume recording
+            controller.resume_recording()
+
+            # Wait for resume to take effect
+            timeout = time.time() + 5
+            while time.time() < timeout:
+                controller.bot_in_db.refresh_from_db()
+                if controller.bot_in_db.state == BotStates.JOINED_RECORDING:
+                    break
+                time.sleep(0.1)
+
+            # Verify we're back in recording state
+            controller.bot_in_db.refresh_from_db()
+            self.assertEqual(controller.bot_in_db.state, BotStates.JOINED_RECORDING)
+
+            # Send closed caption after resume (should create utterance)
+            # Simulate caption coming through the web bot adapter
+            caption_json_after_resume = {"type": "CaptionUpdate", "caption": {"captionId": "caption3", "deviceId": "user1", "text": "Caption after resume", "isFinal": 1}}
+            controller.adapter.handle_caption_update(caption_json_after_resume)
+
+            time.sleep(1)
+
+            # Trigger leave to end the test
+            controller.adapter.only_one_participant_in_meeting_at = time.time() - 10000000000
+            time.sleep(5)
+
+            # Clean up connections in thread
+            connection.close()
+
+        # Run simulation after a short delay
+        threading.Timer(2, simulate_pause_resume_flow).start()
+
+        # Give the bot some time to process
+        bot_thread.join(timeout=20)
+
+        # Refresh the bot from the database
+        self.bot.refresh_from_db()
+
+        # Assert that the bot ended properly
+        self.assertEqual(self.bot.state, BotStates.ENDED)
+
+        # Verify bot events include pause and resume
+        bot_events = self.bot.bot_events.all()
+        event_types = [event.event_type for event in bot_events]
+
+        # Check that we have the expected sequence of events including pause and resume
+        self.assertIn(BotEventTypes.BOT_RECORDING_PERMISSION_GRANTED, event_types)
+        self.assertIn(BotEventTypes.RECORDING_PAUSED, event_types)
+        self.assertIn(BotEventTypes.RECORDING_RESUMED, event_types)
+        self.assertIn(BotEventTypes.POST_PROCESSING_COMPLETED, event_types)
+
+        # Verify the sequence of recording-related events
+        recording_events = [e for e in bot_events if e.event_type in [BotEventTypes.BOT_RECORDING_PERMISSION_GRANTED, BotEventTypes.RECORDING_PAUSED, BotEventTypes.RECORDING_RESUMED]]
+
+        self.assertEqual(len(recording_events), 3)
+        self.assertEqual(recording_events[0].event_type, BotEventTypes.BOT_RECORDING_PERMISSION_GRANTED)
+        self.assertEqual(recording_events[0].old_state, BotStates.JOINED_NOT_RECORDING)
+        self.assertEqual(recording_events[0].new_state, BotStates.JOINED_RECORDING)
+
+        self.assertEqual(recording_events[1].event_type, BotEventTypes.RECORDING_PAUSED)
+        self.assertEqual(recording_events[1].old_state, BotStates.JOINED_RECORDING)
+        self.assertEqual(recording_events[1].new_state, BotStates.JOINED_RECORDING_PAUSED)
+
+        self.assertEqual(recording_events[2].event_type, BotEventTypes.RECORDING_RESUMED)
+        self.assertEqual(recording_events[2].old_state, BotStates.JOINED_RECORDING_PAUSED)
+        self.assertEqual(recording_events[2].new_state, BotStates.JOINED_RECORDING)
+
+        # Verify utterances were created correctly
+        utterances = Utterance.objects.filter(recording=self.recording).order_by("created_at")
+
+        # Should have exactly 2 utterances (before pause and after resume, but NOT during pause)
+        self.assertEqual(utterances.count(), 2)
+
+        utterance_texts = [utterance.transcription.get("transcript") for utterance in utterances]
+        self.assertIn("Caption before pause", utterance_texts)
+        self.assertIn("Caption after resume", utterance_texts)
+        self.assertNotIn("Caption during pause", utterance_texts)
+
+        # Verify that the recording was completed
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.state, RecordingStates.COMPLETE)
+        self.assertEqual(self.recording.started_at, self.original_recording_started_at)
 
         # Cleanup
         controller.cleanup()

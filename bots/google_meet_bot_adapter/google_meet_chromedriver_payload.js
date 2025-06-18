@@ -1,3 +1,33 @@
+function sendChatMessage(text) {
+    
+    // First try to find the chat input textarea
+    let chatInput = document.querySelector('textarea[aria-label="Send a message"]');
+    
+    if (!chatInput) {
+        console.error('Chat input not found');
+        return false;
+    }
+    
+    // Type the message
+    chatInput.focus();
+    chatInput.value = text;
+    
+    // Trigger input event to ensure the UI updates
+    chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+    
+    // Send Enter keypress to submit the message
+    const enterEvent = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true
+    });
+    chatInput.dispatchEvent(enterEvent);
+    
+    return true;
+}
+
 class StyleManager {
     constructor() {
         this.videoTrackIdToSSRC = new Map();
@@ -318,11 +348,52 @@ class StyleManager {
         }
     }
 
+    async openChatPanel() {
+        const chatButton = document.querySelector('button[aria-label="Chat with everyone"]');
+        if (chatButton) {
+            // Click to open the chat panel
+            chatButton.click();
+
+            // Wait for the chat input element to appear
+            const numAttempts = 30;
+            for (let i = 0; i < numAttempts; i++) {
+                // Sleep for 100 milliseconds
+                await new Promise(resolve => setTimeout(resolve, 100));
+                const chatInput = document.querySelector('textarea[aria-label="Send a message"]');
+                if (chatInput) {
+                    break;
+                }
+                const wasLastAttempt = i === numAttempts - 1;
+                if (wasLastAttempt) {
+                    console.log('Failed to find chat input after', numAttempts, 'attempts');
+                    window.ws.sendJson({
+                        type: 'Error',
+                        message: 'Failed to find chat input in openChatPanel'
+                    });
+                    return;
+                }
+            }
+
+            // Click the chat button again to close/minimize the panel
+            chatButton.click();
+
+            window.ws.sendJson({
+                type: 'ChatStatusChange',
+                change: 'ready_to_send'
+            });
+        }
+    }
+
     async start() {
         if (window.initialData.recordingView === 'gallery_view')
         {
             await this.openParticipantList();
+
+            // Sleep for half a second to let the panel close, so that opening the chat panel will work
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
+
+        await this.openChatPanel();
 
         this.onlyShowSubsetofGMeetUI();
         
@@ -1142,6 +1213,7 @@ const messageTypes = [
             { name: 'deviceId', fieldNumber: 1, type: 'string' },
             { name: 'captionId', fieldNumber: 2, type: 'int64' },
             { name: 'version', fieldNumber: 3, type: 'int64' },
+            { name: 'isFinal', fieldNumber: 4, type: 'varint' },
             { name: 'text', fieldNumber: 6, type: 'string' },
             { name: 'languageId', fieldNumber: 8, type: 'int64' }
         ]
@@ -1242,6 +1314,7 @@ window.userManager = userManager;
 window.styleManager = styleManager;
 window.receiverManager = receiverManager;
 window.chatMessageManager = chatMessageManager;
+window.sendChatMessage = sendChatMessage;
 // Create decoders for all message types
 const messageDecoders = {};
 messageTypes.forEach(type => {

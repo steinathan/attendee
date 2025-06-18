@@ -313,6 +313,21 @@ def generate_aggregated_utterances(recording):
     return aggregated_utterances
 
 
+def generate_failed_utterance_json_for_bot_detail_view(recording):
+    failed_utterances = recording.utterances.filter(failure_data__isnull=False).order_by("timestamp_ms")[:10]
+
+    failed_utterances_data = []
+
+    for utterance in failed_utterances:
+        utterance_data = {
+            "id": utterance.id,
+            "failure_data": utterance.failure_data,
+        }
+        failed_utterances_data.append(utterance_data)
+
+    return failed_utterances_data
+
+
 def generate_utterance_json_for_bot_detail_view(recording):
     utterances_data = []
     recording_first_buffer_timestamp_ms = recording.first_buffer_timestamp_ms
@@ -426,6 +441,8 @@ def transcription_provider_from_meeting_url_and_transcription_settings(url, sett
         return TranscriptionProviders.GLADIA
     elif "openai" in settings:
         return TranscriptionProviders.OPENAI
+    elif "assembly_ai" in settings:
+        return TranscriptionProviders.ASSEMBLY_AI
     elif "meeting_closed_captions" in settings:
         return TranscriptionProviders.CLOSED_CAPTION_FROM_PLATFORM
 
@@ -446,6 +463,7 @@ def generate_recordings_json_for_bot_detail_view(bot):
                 "state": recording.state,
                 "url": recording.url,
                 "utterances": generate_utterance_json_for_bot_detail_view(recording),
+                "failed_utterances": generate_failed_utterance_json_for_bot_detail_view(recording),
             }
         )
 

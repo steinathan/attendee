@@ -253,6 +253,7 @@ class DeepgramProviderTest(TransactionTestCase):
             {
                 "reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED,
                 "error_code": "SOME_OTHER",
+                "error_json": {"err_code": "SOME_OTHER"},
             },
         )
 
@@ -294,7 +295,7 @@ class GladiaProviderTest(TransactionTestCase):
             sample_rate=16_000,
         )
         self.utterance.refresh_from_db()
-        # “Real” credential row – we’ll monkey‑patch get_credentials() later
+        # "Real" credential row – we'll monkey‑patch get_credentials() later
         self.cred = Credentials.objects.create(
             project=self.project,
             credential_type=CredModel.CredentialTypes.GLADIA,
@@ -335,7 +336,7 @@ class GladiaProviderTest(TransactionTestCase):
 
             m_request.side_effect = _request_side_effect
 
-            # ---- requests.get (polling) returns “done” once --------------------------------
+            # ---- requests.get (polling) returns "done" once --------------------------------
             done_resp = mock.Mock(status_code=200)
             done_resp.json.return_value = {
                 "status": "done",
@@ -359,7 +360,7 @@ class GladiaProviderTest(TransactionTestCase):
             self.assertEqual(m_request.call_count, 3)
             m_get.assert_called_once_with("https://api.gladia.io/result/abc", headers=mock.ANY)
 
-    # ------------------------------------------------------------------ INVALID CREDENTIALS
+    # ------------------------------------------------------------------ INVALID CREDENTIALS
 
     def test_upload_401_returns_credentials_invalid(self):
         """Gladia 401 on upload → CREDENTIALS_INVALID."""
@@ -376,7 +377,7 @@ class GladiaProviderTest(TransactionTestCase):
             self.assertIsNone(transcript)
             self.assertEqual(failure["reason"], TranscriptionFailureReasons.CREDENTIALS_INVALID)
 
-    # ------------------------------------------------------------------ NO CREDENTIAL ROW
+    # ------------------------------------------------------------------ NO CREDENTIAL ROW
 
     def test_missing_credentials_row(self):
         """No Credentials row → CREDENTIALS_NOT_FOUND."""
@@ -425,7 +426,7 @@ class OpenAIProviderTest(TransactionTestCase):
             sample_rate=16_000,
         )
         self.utt.refresh_from_db()
-        # Real credentials row (the crypto doesn’t matter – we patch .get_credentials)
+        # Real credentials row (the crypto doesn't matter – we patch .get_credentials)
         self.creds = Credentials.objects.create(project=self.project, credential_type=Credentials.CredentialTypes.OPENAI)
 
     # ────────────────────────────────────────────────────────────────────────────────
@@ -471,6 +472,7 @@ class OpenAIProviderTest(TransactionTestCase):
             {
                 "reason": TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED,
                 "status_code": 500,
+                "response_text": "boom",
             },
         )
 
@@ -482,3 +484,191 @@ class OpenAIProviderTest(TransactionTestCase):
 
         self.assertIsNone(tx)
         self.assertEqual(failure, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND})
+
+
+from unittest import mock
+
+from django.test import TransactionTestCase
+
+from bots.tasks.process_utterance_task import get_transcription_via_assemblyai
+
+
+class AssemblyAIProviderTest(TransactionTestCase):
+    """Unit‑tests for bots.tasks.process_utterance_task.get_transcription_via_assemblyai"""
+
+    def setUp(self):
+        # Minimal DB fixtures
+        self.org = Organization.objects.create(name="Org")
+        self.project = Project.objects.create(name="Proj", organization=self.org)
+        self.bot = Bot.objects.create(project=self.project, meeting_url="https://zoom.us/j/999")
+
+        self.recording = Recording.objects.create(
+            bot=self.bot,
+            recording_type=1,
+            transcription_type=1,
+            state=RecordingStates.COMPLETE,
+            transcription_provider=5,  # ASSEMBLY_AI
+        )
+
+        self.participant = Participant.objects.create(bot=self.bot, uuid="p1")
+        self.utterance = Utterance.objects.create(
+            recording=self.recording,
+            participant=self.participant,
+            audio_blob=b"pcm-bytes",
+            timestamp_ms=0,
+            duration_ms=600,
+            sample_rate=16_000,
+        )
+        self.utterance.refresh_from_db()
+        self.cred = CredModel.objects.create(
+            project=self.project,
+            credential_type=CredModel.CredentialTypes.ASSEMBLY_AI,
+        )
+
+    def _patch_creds(self):
+        """Always return a fake API key."""
+        return mock.patch.object(CredModel, "get_credentials", return_value={"api_key": "fake-assembly-key"})
+
+    def test_happy_path(self):
+        """Upload → transcribe → poll succeeds and returns formatted transcript."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+            mock.patch("bots.tasks.process_utterance_task.requests.get") as m_get,
+            mock.patch("bots.tasks.process_utterance_task.requests.delete") as m_delete,
+        ):
+            # 1. Mock upload response
+            upload_response = mock.Mock(status_code=200)
+            upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/upload/123"}
+
+            # 2. Mock transcript creation response
+            transcript_response = mock.Mock(status_code=200)
+            transcript_response.json.return_value = {"id": "transcript-abc"}
+
+            m_post.side_effect = [upload_response, transcript_response]
+
+            # 3. Mock polling responses
+            processing_response = mock.Mock(status_code=200)
+            processing_response.json.return_value = {"status": "processing"}
+
+            done_response = mock.Mock(status_code=200)
+            done_response.json.return_value = {
+                "status": "completed",
+                "text": "hello assembly",
+                "words": [
+                    {"text": "hello", "start": 100, "end": 200, "confidence": 0.9},
+                    {"text": "assembly", "start": 300, "end": 500, "confidence": 0.95},
+                ],
+            }
+            m_get.side_effect = [processing_response, done_response]
+
+            # 4. Mock delete response
+            delete_response = mock.Mock(status_code=200)
+            m_delete.return_value = delete_response
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            # Assertions
+            self.assertIsNone(failure)
+            self.assertEqual(transcript["transcript"], "hello assembly")
+            self.assertEqual(len(transcript["words"]), 2)
+            self.assertEqual(transcript["words"][0]["word"], "hello")
+
+            self.assertEqual(m_post.call_count, 2)
+            self.assertEqual(m_get.call_count, 2)
+            m_delete.assert_called_once_with("https://api.assemblyai.com/v2/transcript/transcript-abc", headers=mock.ANY)
+
+    def test_upload_401_returns_credentials_invalid(self):
+        """AssemblyAI 401 on upload → CREDENTIALS_INVALID."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+        ):
+            resp401 = mock.Mock(status_code=401)
+            m_post.return_value = resp401
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            self.assertIsNone(transcript)
+            self.assertEqual(failure["reason"], TranscriptionFailureReasons.CREDENTIALS_INVALID)
+            m_post.assert_called_once()
+
+    def test_missing_credentials_row(self):
+        """No Credentials row → CREDENTIALS_NOT_FOUND."""
+        self.cred.delete()
+        transcript, failure = get_transcription_via_assemblyai(self.utterance)
+        self.assertIsNone(transcript)
+        self.assertEqual(failure["reason"], TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND)
+
+    def test_transcription_request_failed(self):
+        """A non-200 response when creating the transcript job is handled."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+        ):
+            upload_response = mock.Mock(status_code=200)
+            upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/upload/123"}
+
+            transcript_response = mock.Mock(status_code=400, text="Bad Request")
+
+            m_post.side_effect = [upload_response, transcript_response]
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            self.assertIsNone(transcript)
+            self.assertEqual(failure["reason"], TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED)
+            self.assertEqual(failure["status_code"], 400)
+
+    def test_polling_error(self):
+        """An 'error' status during polling is handled."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+            mock.patch("bots.tasks.process_utterance_task.requests.get") as m_get,
+        ):
+            upload_response = mock.Mock(status_code=200)
+            upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/upload/123"}
+            transcript_response = mock.Mock(status_code=200)
+            transcript_response.json.return_value = {"id": "transcript-abc"}
+            m_post.side_effect = [upload_response, transcript_response]
+
+            error_response = mock.Mock(status_code=200)
+            error_response.json.return_value = {"status": "error", "error": "Something went wrong"}
+            m_get.return_value = error_response
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            self.assertIsNone(transcript)
+            self.assertEqual(failure["reason"], TranscriptionFailureReasons.TRANSCRIPTION_REQUEST_FAILED)
+            self.assertEqual(failure["error"], "Something went wrong")
+            m_get.assert_called_once()
+
+    def test_polling_timeout(self):
+        """Polling that never completes results in a TIMED_OUT failure."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+            mock.patch("bots.tasks.process_utterance_task.requests.get") as m_get,
+            mock.patch("bots.tasks.process_utterance_task.time.sleep"),  # speed up test
+        ):
+            upload_response = mock.Mock(status_code=200)
+            upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/upload/123"}
+            transcript_response = mock.Mock(status_code=200)
+            transcript_response.json.return_value = {"id": "transcript-abc"}
+            m_post.side_effect = [upload_response, transcript_response]
+
+            processing_response = mock.Mock(status_code=200)
+            processing_response.json.return_value = {"status": "processing"}
+            m_get.return_value = processing_response
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            self.assertIsNone(transcript)
+            self.assertEqual(failure["reason"], TranscriptionFailureReasons.TIMED_OUT)
+            # The code has max_retries = 120
+            self.assertEqual(m_get.call_count, 120)

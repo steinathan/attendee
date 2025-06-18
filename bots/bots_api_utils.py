@@ -10,22 +10,22 @@ from django.urls import reverse
 
 from .models import (
     Bot,
+    BotChatMessageRequest,
     BotEventManager,
     BotEventTypes,
     BotMediaRequest,
     BotMediaRequestMediaTypes,
+    BotStates,
     Credentials,
     MediaBlob,
     MeetingTypes,
     Project,
     Recording,
-    RecordingTypes,
     TranscriptionTypes,
 )
 from .serializers import (
     CreateBotSerializer,
 )
-from .tasks import run_bot
 from .utils import meeting_type_from_url, transcription_provider_from_meeting_url_and_transcription_settings
 
 logger = logging.getLogger(__name__)
@@ -39,18 +39,30 @@ def send_sync_command(bot, command="sync"):
     redis_client.publish(channel, json.dumps(message))
 
 
-def launch_bot(bot):
-    # If this instance is running in Kubernetes, use the Kubernetes pod creator
-    # which spins up a new pod for the bot
-    if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
-        from .bot_pod_creator import BotPodCreator
+def create_bot_chat_message_request(bot, chat_message_data):
+    """
+    Creates a BotChatMessageRequest for the given bot with the provided data.
 
-        bot_pod_creator = BotPodCreator()
-        create_pod_result = bot_pod_creator.create_bot_pod(bot_id=bot.id, bot_name=bot.k8s_pod_name())
-        logger.info(f"Bot {bot.id} launched via Kubernetes: {create_pod_result}")
-    else:
-        # Default to launching bot via celery
-        run_bot.delay(bot.id)
+    Args:
+        bot: The Bot instance
+        chat_message_data: Validated data containing to_user_uuid, to, and message
+
+    Returns:
+        BotChatMessageRequest: The created chat message request
+    """
+    try:
+        bot_chat_message_request = BotChatMessageRequest.objects.create(
+            bot=bot,
+            to_user_uuid=chat_message_data.get("to_user_uuid"),
+            to=chat_message_data["to"],
+            message=chat_message_data["message"],
+        )
+    except Exception as e:
+        error_message_first_line = str(e).split("\n")[0]
+        logging.error(f"Error creating bot chat message request: {error_message_first_line}")
+        raise ValidationError(f"Error creating the bot chat message request: {error_message_first_line}.")
+
+    return bot_chat_message_request
 
 
 def create_bot_media_request_for_image(bot, image):
@@ -91,6 +103,7 @@ def validate_meeting_url_and_credentials(meeting_url, project):
 class BotCreationSource(str, Enum):
     API = "api"
     DASHBOARD = "dashboard"
+    SCHEDULER = "scheduler"
 
 
 def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple[Bot | None, dict | None]:
@@ -117,7 +130,10 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
     debug_settings = serializer.validated_data["debug_settings"]
     automatic_leave_settings = serializer.validated_data["automatic_leave_settings"]
     bot_image = serializer.validated_data["bot_image"]
+    bot_chat_message = serializer.validated_data["bot_chat_message"]
     metadata = serializer.validated_data["metadata"]
+    join_at = serializer.validated_data["join_at"]
+    initial_state = BotStates.SCHEDULED if join_at else BotStates.READY
 
     settings = {
         "transcription_settings": transcription_settings,
@@ -134,11 +150,13 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
             name=bot_name,
             settings=settings,
             metadata=metadata,
+            join_at=join_at,
+            state=initial_state,
         )
 
         Recording.objects.create(
             bot=bot,
-            recording_type=RecordingTypes.AUDIO_AND_VIDEO,
+            recording_type=bot.recording_type(),
             transcription_type=TranscriptionTypes.NON_REALTIME,
             transcription_provider=transcription_provider_from_meeting_url_and_transcription_settings(meeting_url, transcription_settings),
             is_default_recording=True,
@@ -150,7 +168,14 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
             except ValidationError as e:
                 return None, {"error": e.messages[0]}
 
-        # Try to transition the state from READY to JOINING
-        BotEventManager.create_event(bot=bot, event_type=BotEventTypes.JOIN_REQUESTED, event_metadata={"source": source})
+        if bot_chat_message:
+            try:
+                create_bot_chat_message_request(bot, bot_chat_message)
+            except ValidationError as e:
+                return None, {"error": e.messages[0]}
+
+        if bot.state == BotStates.READY:
+            # Try to transition the state from READY to JOINING
+            BotEventManager.create_event(bot=bot, event_type=BotEventTypes.JOIN_REQUESTED, event_metadata={"source": source})
 
         return bot, None

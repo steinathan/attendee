@@ -11,7 +11,7 @@ To create a webhook:
 1. Click on "Settings → Webhooks" in the sidebar
 2. Click "Create Webhook" 
 3. Provide an HTTPS URL that will receive webhook events
-4. Select the triggers you want to receive notifications for (we currently have one trigger: `bot.state_change`)
+4. Select the triggers you want to receive notifications for (we currently have two triggers: `bot.state_change` and `transcript.update`)
 5. Click "Create" to save your subscription
 
 ## Webhook Payload
@@ -23,7 +23,7 @@ When a webhook is delivered, Attendee will send an HTTP POST request to your web
   "idempotency_key": < UUID that uniquely identifies this webhook delivery >,
   "bot_id": < Id of the bot associated with the webhook delivery >,
   "bot_metadata": < Any metadata associated with the bot >,
-  "trigger": < Trigger for the webhook. Currently, the only trigger is bot.state_change, which is fired whenever the bot changes its state. >,
+  "trigger": < Trigger for the webhook. Currently, the two triggers are bot.state_change, which is fired whenever the bot changes its state and transcript.update which is fired when the transcript is updated. >,
   "data": < Event-specific data >
 }
 ```
@@ -55,6 +55,24 @@ The data field will look like this
   "created_at": "2023-07-15T14:30:45.123456Z",
   "event_type": "post_processing_completed",
   "event_sub_type": null,
+}
+```
+
+### Payload for `transcript.update` trigger
+
+For webhooks triggered by `transcript.update`, the `data` field contains a single utterance:
+
+```
+{
+  "speaker_name": <The name of the speaker>,
+  "speaker_uuid": <The UUID of the speaker within the meeting>,
+  "speaker_user_uuid": <The UUID of the speaker's user account within the meeting platform>,
+  "timestamp_ms": <The timestamp of the utterance in milliseconds>,
+  "duration_ms": <The duration of the utterance in milliseconds>,
+  "transcription": {
+    "transcript": <The utterance text>,
+    "words": <The word-level timestamps of the utterance if they exist>,
+  },
 }
 ```
 
@@ -99,7 +117,7 @@ def sign_payload(payload, secret):
     Sign a webhook payload using HMAC-SHA256. Returns a base64-encoded HMAC-SHA256 signature
     """
     # Convert the payload to a canonical JSON string
-    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
     # Decode the secret
     secret_decoded = base64.b64decode(secret)

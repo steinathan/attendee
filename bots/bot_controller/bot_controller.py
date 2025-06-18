@@ -12,9 +12,13 @@ import redis
 from django.core.files.base import ContentFile
 from django.utils import timezone
 
+from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.bot_adapter import BotAdapter
+from bots.bots_api_utils import BotCreationSource
 from bots.models import (
     Bot,
+    BotChatMessageRequestManager,
+    BotChatMessageRequestStates,
     BotDebugScreenshot,
     BotEventManager,
     BotEventSubTypes,
@@ -32,13 +36,15 @@ from bots.models import (
     RecordingFormats,
     RecordingManager,
     RecordingStates,
+    RecordingTypes,
     TranscriptionProviders,
     Utterance,
+    WebhookTriggerTypes,
 )
 from bots.utils import meeting_type_from_url
+from bots.webhook_utils import trigger_webhook
 
 from .audio_output_manager import AudioOutputManager
-from .automatic_leave_configuration import AutomaticLeaveConfiguration
 from .closed_caption_manager import ClosedCaptionManager
 from .file_uploader import FileUploader
 from .gstreamer_pipeline import GstreamerPipeline
@@ -109,6 +115,7 @@ class BotController:
             automatic_leave_configuration=self.automatic_leave_configuration,
             add_encoded_mp4_chunk_callback=None,
             recording_view=self.bot_in_db.recording_view(),
+            teams_closed_captions_language=self.bot_in_db.teams_closed_captions_language(),
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
             start_recording_screen_callback=self.screen_and_audio_recorder.start_recording,
             stop_recording_screen_callback=self.screen_and_audio_recorder.stop_recording,
@@ -175,15 +182,6 @@ class BotController:
         if meeting_type == MeetingTypes.ZOOM:
             return 0.9
         return 0.1
-
-    def get_num_audio_sources(self):
-        meeting_type = self.get_meeting_type()
-        if meeting_type == MeetingTypes.ZOOM:
-            return 1
-        elif meeting_type == MeetingTypes.GOOGLE_MEET:
-            return 3
-        elif meeting_type == MeetingTypes.TEAMS:
-            return 1
 
     def get_bot_adapter(self):
         meeting_type = self.get_meeting_type()
@@ -334,7 +332,10 @@ class BotController:
         if self.bot_in_db.rtmp_destination_url():
             self.pipeline_configuration = PipelineConfiguration.rtmp_streaming_bot()
         else:
-            self.pipeline_configuration = PipelineConfiguration.recorder_bot()
+            if self.bot_in_db.recording_type() == RecordingTypes.AUDIO_ONLY:
+                self.pipeline_configuration = PipelineConfiguration.audio_recorder_bot()
+            else:
+                self.pipeline_configuration = PipelineConfiguration.recorder_bot()
 
     def get_gstreamer_sink_type(self):
         if self.pipeline_configuration.rtmp_stream_audio or self.pipeline_configuration.rtmp_stream_video:
@@ -348,6 +349,8 @@ class BotController:
 
         if self.bot_in_db.recording_format() == RecordingFormats.WEBM:
             return GstreamerPipeline.OUTPUT_FORMAT_WEBM
+        elif self.bot_in_db.recording_format() == RecordingFormats.MP3:
+            return GstreamerPipeline.OUTPUT_FORMAT_MP3
         else:
             return GstreamerPipeline.OUTPUT_FORMAT_MP4
 
@@ -425,7 +428,6 @@ class BotController:
                 video_frame_size=self.bot_in_db.recording_dimensions(),
                 audio_format=self.get_audio_format(),
                 output_format=self.get_gstreamer_output_format(),
-                num_audio_sources=self.get_num_audio_sources(),
                 sink_type=self.get_gstreamer_sink_type(),
                 file_location=self.get_recording_file_location(),
             )
@@ -436,6 +438,7 @@ class BotController:
             self.screen_and_audio_recorder = ScreenAndAudioRecorder(
                 file_location=self.get_recording_file_location(),
                 recording_dimensions=self.bot_in_db.recording_dimensions(),
+                audio_only=not (self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video),
             )
 
         self.adapter = self.get_bot_adapter()
@@ -518,6 +521,23 @@ class BotController:
             logger.info("take_action_based_on_bot_in_db - LEAVING")
             BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
             self.adapter.leave()
+        if self.bot_in_db.state == BotStates.STAGED:
+            logger.info(f"take_action_based_on_bot_in_db - STAGED. For now, this is a no-op. join_at = {self.bot_in_db.join_at.isoformat()}")
+
+    def join_if_staged_and_time_to_join(self):
+        if self.bot_in_db.state != BotStates.STAGED:
+            return
+        if self.bot_in_db.join_at > timezone.now() + timedelta(seconds=self.adapter.get_staged_bot_join_delay_seconds()):
+            return
+
+        # Transition to JOINING
+        logger.info(f"Joining bot {self.bot_in_db.id} ({self.bot_in_db.object_id}) because join_at is {self.bot_in_db.join_at.isoformat()} and current time is {timezone.now().isoformat()}")
+        BotEventManager.create_event(
+            bot=self.bot_in_db,
+            event_type=BotEventTypes.JOIN_REQUESTED,
+            event_metadata={"source": BotCreationSource.SCHEDULER},
+        )
+        self.take_action_based_on_bot_in_db()
 
     def get_participant(self, participant_id):
         return self.adapter.get_participant(participant_id)
@@ -591,6 +611,12 @@ class BotController:
             logger.info(f"Error playing video media request: {e}")
             BotMediaRequestManager.set_media_request_failed_to_play(oldest_enqueued_media_request)
 
+    def take_action_based_on_chat_message_requests_in_db(self):
+        chat_message_requests = self.bot_in_db.chat_message_requests.filter(state=BotChatMessageRequestStates.ENQUEUED)
+        for chat_message_request in chat_message_requests:
+            self.adapter.send_chat_message(text=chat_message_request.message)
+            BotChatMessageRequestManager.set_chat_message_request_sent(chat_message_request)
+
     def take_action_based_on_media_requests_in_db(self):
         self.take_action_based_on_audio_media_requests_in_db()
         self.take_action_based_on_image_media_requests_in_db()
@@ -624,8 +650,48 @@ class BotController:
                 logger.info(f"Syncing media requests for bot {self.bot_in_db.object_id}")
                 self.bot_in_db.refresh_from_db()
                 self.take_action_based_on_media_requests_in_db()
+            elif command == "sync_chat_message_requests":
+                logger.info(f"Syncing chat message requests for bot {self.bot_in_db.object_id}")
+                self.bot_in_db.refresh_from_db()
+                self.take_action_based_on_chat_message_requests_in_db()
+            elif command == "pause_recording":
+                logger.info(f"Pausing recording for bot {self.bot_in_db.object_id}")
+                self.bot_in_db.refresh_from_db()
+                self.pause_recording()
+            elif command == "resume_recording":
+                logger.info(f"Resuming recording for bot {self.bot_in_db.object_id}")
+                self.bot_in_db.refresh_from_db()
+                self.resume_recording()
             else:
                 logger.info(f"Unknown command: {command}")
+
+    def pause_recording(self):
+        if not BotEventManager.is_state_that_can_pause_recording(self.bot_in_db.state):
+            logger.info(f"Bot {self.bot_in_db.object_id} is in state {BotStates.state_to_api_code(self.bot_in_db.state)} and cannot pause recording")
+            return
+        pause_recording_success = self.screen_and_audio_recorder.pause_recording()
+        if not pause_recording_success:
+            logger.error(f"Failed to pause recording for bot {self.bot_in_db.object_id}")
+            return
+        self.adapter.pause_recording()
+        BotEventManager.create_event(
+            bot=self.bot_in_db,
+            event_type=BotEventTypes.RECORDING_PAUSED,
+        )
+
+    def resume_recording(self):
+        if not BotEventManager.is_state_that_can_resume_recording(self.bot_in_db.state):
+            logger.info(f"Bot {self.bot_in_db.object_id} is in state {BotStates.state_to_api_code(self.bot_in_db.state)} and cannot resume recording")
+            return
+        resume_recording_success = self.screen_and_audio_recorder.resume_recording()
+        if not resume_recording_success:
+            logger.error(f"Failed to resume recording for bot {self.bot_in_db.object_id}")
+            return
+        self.adapter.resume_recording()
+        BotEventManager.create_event(
+            bot=self.bot_in_db,
+            event_type=BotEventTypes.RECORDING_RESUMED,
+        )
 
     def set_bot_heartbeat(self):
         if self.bot_in_db.last_heartbeat_timestamp is None or self.bot_in_db.last_heartbeat_timestamp <= int(timezone.now().timestamp()) - 60:
@@ -659,6 +725,9 @@ class BotController:
 
             # Process video output
             self.video_output_manager.monitor_currently_playing_video_media_request()
+
+            # For staged bots, check if its time to join
+            self.join_if_staged_and_time_to_join()
             return True
 
         except Exception as e:
@@ -669,7 +738,7 @@ class BotController:
             return False
 
     def get_recording_in_progress(self):
-        recordings_in_progress = Recording.objects.filter(bot=self.bot_in_db, state=RecordingStates.IN_PROGRESS)
+        recordings_in_progress = Recording.objects.filter(bot=self.bot_in_db, state__in=[RecordingStates.IN_PROGRESS, RecordingStates.PAUSED])
         if recordings_in_progress.count() == 0:
             return None
         if recordings_in_progress.count() > 1:
@@ -703,6 +772,13 @@ class BotController:
                 "duration_ms": message["duration_ms"],
                 "sample_rate": None,
             },
+        )
+
+        # Create webhook event
+        trigger_webhook(
+            webhook_trigger_type=WebhookTriggerTypes.TRANSCRIPT_UPDATE,
+            bot=self.bot_in_db,
+            payload=utterance.webhook_payload(),
         )
 
         RecordingManager.set_recording_transcription_in_progress(recording_in_progress)
@@ -868,11 +944,11 @@ class BotController:
                     "step": message.get("step"),
                     "current_time": message.get("current_time").isoformat(),
                     "exception_type": message.get("exception_type"),
-                    "exception_message": message.get("exception_message"),
                     "inner_exception_type": message.get("inner_exception_type"),
-                    "inner_exception_message": message.get("inner_exception_message"),
                 },
             )
+
+            logger.info(f"Created bot event for #{self.bot_in_db.object_id} for UI element not found. Exception info: {message}")
 
             if screenshot_available:
                 # Create debug screenshot
@@ -999,6 +1075,11 @@ class BotController:
         if message.get("message") == BotAdapter.Messages.BOT_JOINED_MEETING:
             logger.info("Received message that bot joined meeting")
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.BOT_JOINED_MEETING)
+            return
+
+        if message.get("message") == BotAdapter.Messages.READY_TO_SEND_CHAT_MESSAGE:
+            logger.info("Received message that bot is ready to send chat message")
+            self.take_action_based_on_chat_message_requests_in_db()
             return
 
         if message.get("message") == BotAdapter.Messages.READY_TO_SHOW_BOT_IMAGE:

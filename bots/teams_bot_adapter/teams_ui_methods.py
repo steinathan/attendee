@@ -46,12 +46,6 @@ class TeamsUIMethods:
             logger.info(f"Error occurred when clicking element {step}, will retry")
             raise UiCouldNotClickElementException("Error occurred when clicking element", step, e)
 
-    def look_for_denied_request_element(self, step):
-        denied_request_element = self.find_element_by_selector(By.XPATH, '//*[contains(text(), "Your request to join was declined")]')
-        if denied_request_element:
-            logger.info("The request to join the Teams meeting was declined. Raising UiRequestToJoinDeniedException")
-            raise UiRequestToJoinDeniedException("The request to join the Teams meeting was declined", step)
-
     def look_for_waiting_to_be_admitted_element(self, step):
         waiting_element = self.find_element_by_selector(By.XPATH, '//*[contains(text(), "Someone will let you in soon")]')
         if waiting_element:
@@ -89,10 +83,27 @@ class TeamsUIMethods:
                 raise UiCouldNotLocateElementException("Could not find name input. Unknown error.", "name_input", e)
 
     def click_captions_button(self):
-        logger.info("Waiting for the Language and Speech button...")
-        language_and_speech_button = self.locate_element(step="language_and_speech_button", condition=EC.presence_of_element_located((By.ID, "LanguageSpeechMenuControl-id")), wait_time_seconds=10)
-        logger.info("Clicking the language and speech button...")
-        self.click_element(language_and_speech_button, "language_and_speech_button")
+        logger.info("Enabling closed captions programatically...")
+        closed_caption_enable_result = self.driver.execute_script("return window.callManager?.enableClosedCaptions()")
+        if closed_caption_enable_result:
+            logger.info("Closed captions enabled programatically")
+
+            if self.teams_closed_captions_language:
+                closed_caption_set_language_result = self.driver.execute_script(f"return window.callManager?.setClosedCaptionsLanguage('{self.teams_closed_captions_language}')")
+                if closed_caption_set_language_result:
+                    logger.info("Closed captions language set programatically")
+                else:
+                    logger.error("Failed to set closed captions language programatically")
+
+            return
+
+        logger.info("Failed to enable closed captions programatically. Waiting for the Language and Speech button...")
+        try:
+            language_and_speech_button = self.locate_element(step="language_and_speech_button", condition=EC.presence_of_element_located((By.ID, "LanguageSpeechMenuControl-id")), wait_time_seconds=4)
+            logger.info("Clicking the language and speech button...")
+            self.click_element(language_and_speech_button, "language_and_speech_button")
+        except Exception:
+            logger.info("Unable to find language and speech button. Exception will be caught because the caption button may be directly visible instead.")
 
         logger.info("Waiting for the closed captions button...")
         closed_captions_button = self.locate_element(step="closed_captions_button", condition=EC.presence_of_element_located((By.ID, "closed-captions-button")), wait_time_seconds=10)
@@ -145,8 +156,9 @@ class TeamsUIMethods:
     def look_for_denied_your_request_element(self, step):
         denied_your_request_element = self.find_element_by_selector(
             By.XPATH,
-            '//*[contains(text(), "but you were denied access to the meeting")]',
+            '//*[contains(text(), "but you were denied access to the meeting") or contains(text(), "Your request to join was declined")]',
         )
+
         if denied_your_request_element:
             logger.info("Someone in the call denied our request to join. Raising UiRequestToJoinDeniedException")
             dismiss_button = self.locate_element(step="closed_captions_button", condition=EC.presence_of_element_located((By.CSS_SELECTOR, '[data-tid="calling-retry-cancelbutton"]')), wait_time_seconds=2)
@@ -157,12 +169,12 @@ class TeamsUIMethods:
 
     def select_speaker_view(self):
         logger.info("Waiting for the view button...")
-        view_button = self.locate_element(step="view_button", condition=EC.presence_of_element_located((By.ID, "view-mode-button")), wait_time_seconds=60)
+        view_button = self.locate_element(step="view_button", condition=EC.presence_of_element_located((By.CSS_SELECTOR, "#view-mode-button, #custom-view-button")), wait_time_seconds=60)
         logger.info("Clicking the view button...")
         self.click_element(view_button, "view_button")
 
         logger.info("Waiting for the speaker view button...")
-        speaker_view_button = self.locate_element(step="speaker_view_button", condition=EC.presence_of_element_located((By.ID, "custom-view-button-SpeakerViewButton")), wait_time_seconds=10)
+        speaker_view_button = self.locate_element(step="speaker_view_button", condition=EC.presence_of_element_located((By.CSS_SELECTOR, "#custom-view-button-SpeakerViewButton, #SpeakerView-button")), wait_time_seconds=10)
         logger.info("Clicking the speaker view button...")
         self.click_element(speaker_view_button, "speaker_view_button")
 
@@ -192,12 +204,6 @@ class TeamsUIMethods:
         logger.info("Clicking the Join now button...")
         self.click_element(join_button, "join_button")
 
-        # Check if we were denied entry
-        try:
-            WebDriverWait(self.driver, 10).until(lambda d: self.look_for_denied_request_element("join_meeting") or False)
-        except TimeoutException:
-            pass  # This is expected if we're not denied
-
         # Wait for meeting to load and enable captions
         self.click_show_more_button()
 
@@ -215,7 +221,7 @@ class TeamsUIMethods:
             EC.presence_of_element_located(
                 (
                     By.CSS_SELECTOR,
-                    '[data-inp="hangup-button"]',
+                    '[data-inp="hangup-button"], #hangup-button',
                 )
             )
         )

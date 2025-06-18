@@ -4,7 +4,7 @@ from django.core.files.base import ContentFile
 from django.test import TransactionTestCase
 from django.test.utils import override_settings
 
-from bots.models import Bot, BotEventTypes, BotStates, ChatMessage, ChatMessageToOptions, Organization, Participant, Project, Recording, RecordingStates, Utterance
+from bots.models import Bot, BotDebugScreenshot, BotEvent, BotEventTypes, BotStates, ChatMessage, ChatMessageToOptions, Organization, Participant, Project, Recording, RecordingStates, Utterance
 
 
 def mock_file_field_delete_sets_name_to_none(instance, save=True):
@@ -89,6 +89,17 @@ class TestBotDataDeletion(TransactionTestCase):
         self.chat_message1 = ChatMessage.objects.create(bot=self.bot1, to=ChatMessageToOptions.ONLY_BOT, participant=self.participant1, text="Hello, world!", timestamp=1000)
         self.chat_message2 = ChatMessage.objects.create(bot=self.bot2, to=ChatMessageToOptions.EVERYONE, participant=self.participant2, text="Hello, world!", timestamp=1000)
 
+        # Create bot events and debug screenshots for each bot
+        self.event1 = BotEvent.objects.create(bot=self.bot1, old_state=BotStates.ENDED, new_state=BotStates.ENDED, event_type=BotEventTypes.BOT_JOINED_MEETING)
+        self.event2 = BotEvent.objects.create(bot=self.bot2, old_state=BotStates.ENDED, new_state=BotStates.ENDED, event_type=BotEventTypes.BOT_JOINED_MEETING)
+
+        # Create debug screenshots for each event
+        self.screenshot1 = BotDebugScreenshot.objects.create(bot_event=self.event1)
+        self.screenshot1.file.save("test1.png", ContentFile(b"test screenshot 1"))
+
+        self.screenshot2 = BotDebugScreenshot.objects.create(bot_event=self.event2)
+        self.screenshot2.file.save("test2.png", ContentFile(b"test screenshot 2"))
+
     def tearDown(self):
         # Stop all patches
         self.save_patch.stop()
@@ -102,6 +113,7 @@ class TestBotDataDeletion(TransactionTestCase):
         self.assertEqual(Participant.objects.count(), 2)
         self.assertEqual(Recording.objects.count(), 2)
         self.assertEqual(Utterance.objects.count(), 2)
+        self.assertEqual(BotDebugScreenshot.objects.count(), 2)
 
         # Delete data for bot1
         self.bot1.delete_data()
@@ -110,12 +122,14 @@ class TestBotDataDeletion(TransactionTestCase):
         self.assertEqual(Participant.objects.filter(bot=self.bot1).count(), 0)
         self.assertEqual(Utterance.objects.filter(recording__bot=self.bot1).count(), 0)
         self.assertEqual(ChatMessage.objects.filter(bot=self.bot1).count(), 0)
+        self.assertEqual(BotDebugScreenshot.objects.filter(bot_event__bot=self.bot1).count(), 0)
 
         # Verify bot2's data is still intact
         self.assertEqual(Participant.objects.filter(bot=self.bot2).count(), 1)
         self.assertEqual(Recording.objects.filter(bot=self.bot2).count(), 1)
         self.assertEqual(Utterance.objects.filter(recording__bot=self.bot2).count(), 1)
         self.assertEqual(ChatMessage.objects.filter(bot=self.bot2).count(), 1)
+        self.assertEqual(BotDebugScreenshot.objects.filter(bot_event__bot=self.bot2).count(), 1)
 
         # Verify bot2's state is still ENDED
         self.bot2.refresh_from_db()

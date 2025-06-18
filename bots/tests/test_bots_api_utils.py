@@ -1,8 +1,11 @@
+from datetime import timedelta
+
 from django.test import TestCase
+from django.utils import timezone
 
 from accounts.models import Organization
 from bots.bots_api_utils import BotCreationSource, create_bot, validate_meeting_url_and_credentials
-from bots.models import Project
+from bots.models import BotEventTypes, BotStates, Project
 
 
 class TestValidateMeetingUrlAndCredentials(TestCase):
@@ -47,11 +50,29 @@ class TestCreateBot(TestCase):
         self.assertIsNotNone(bot.recordings.first())
         self.assertIsNotNone(bot.media_requests.first())
         self.assertIsNone(error)
-        self.assertEqual(bot.bot_events.first().metadata["source"], BotCreationSource.API)
+        events = bot.bot_events
+        self.assertEqual(events.count(), 1)
+        self.assertEqual(events.first().metadata["source"], BotCreationSource.API)
+        self.assertEqual(events.first().event_type, BotEventTypes.JOIN_REQUESTED)
 
-    def create_bot_with_google_meet_url_with_http(self):
+    def test_create_bot_with_google_meet_url_with_http(self):
         bot, error = create_bot(data={"meeting_url": "http://meet.google.com/abc-defg-hij", "bot_name": "Test Bot"}, source=BotCreationSource.DASHBOARD, project=self.project)
-        self.assertIsNotNone(bot)
+        self.assertIsNone(bot)
         self.assertIsNotNone(error)
-        self.assertEqual(error, {"error": "Google Meet URL must start with https://meet.google.com/"})
-        self.assertEqual(bot.bot_events.first().metadata["source"], BotCreationSource.DASHBOARD)
+        self.assertEqual(error, {"meeting_url": ["Google Meet URL must start with https://meet.google.com/"]})
+
+    def test_create_scheduled_bot(self):
+        """Test creating a bot with join_at timestamp"""
+        future_time = timezone.now() + timedelta(hours=1)
+        bot, error = create_bot(data={"meeting_url": "https://meet.google.com/abc-defg-hij", "bot_name": "Scheduled Test Bot", "join_at": future_time.isoformat()}, source=BotCreationSource.API, project=self.project)
+
+        self.assertIsNotNone(bot)
+        self.assertIsNone(error)
+        self.assertEqual(bot.state, BotStates.SCHEDULED)
+        self.assertIsNotNone(bot.join_at)
+        self.assertEqual(bot.join_at.replace(microsecond=0), future_time.replace(microsecond=0))
+        self.assertIsNotNone(bot.recordings.first())
+
+        # Verify no events are created for scheduled bots
+        events = bot.bot_events
+        self.assertEqual(events.count(), 0)
