@@ -3,18 +3,23 @@ import json
 import logging
 import math
 import os
+import uuid
 
 import stripe
+from allauth.account.utils import send_email_confirmation
 from django.conf import settings
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.db import models
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
 from django.http import HttpResponse, QueryDict
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.views import View
-from django.views.generic.list import ListView
+from django.views.generic import ListView
 
-from .bots_api_utils import BotCreationSource, create_bot
+from accounts.models import User
+
+from .bots_api_utils import BotCreationSource, create_bot, create_webhook_subscription
 from .launch_bot_utils import launch_bot
 from .models import (
     ApiKey,
@@ -23,10 +28,14 @@ from .models import (
     BotEventSubTypes,
     BotEventTypes,
     BotStates,
+    ChatMessage,
     Credentials,
     CreditTransaction,
+    Participant,
+    ParticipantEventTypes,
     Project,
     RecordingStates,
+    RecordingTranscriptionStates,
     Utterance,
     WebhookDeliveryAttempt,
     WebhookDeliveryAttemptStatus,
@@ -167,8 +176,18 @@ class CreateCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
 
                 if not all(credentials_data.values()):
                     return HttpResponse("Missing required credentials data", status=400)
+            elif credential_type == Credentials.CredentialTypes.SARVAM:
+                credentials_data = {"api_key": request.POST.get("api_key")}
+
+                if not all(credentials_data.values()):
+                    return HttpResponse("Missing required credentials data", status=400)
             elif credential_type == Credentials.CredentialTypes.GOOGLE_TTS:
                 credentials_data = {"service_account_json": request.POST.get("service_account_json")}
+
+                if not all(credentials_data.values()):
+                    return HttpResponse("Missing required credentials data", status=400)
+            elif credential_type == Credentials.CredentialTypes.TEAMS_BOT_LOGIN:
+                credentials_data = {"username": request.POST.get("username"), "password": request.POST.get("password")}
 
                 if not all(credentials_data.values()):
                     return HttpResponse("Missing required credentials data", status=400)
@@ -192,8 +211,12 @@ class CreateCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                 return render(request, "projects/partials/openai_credentials.html", context)
             elif credential.credential_type == Credentials.CredentialTypes.ASSEMBLY_AI:
                 return render(request, "projects/partials/assembly_ai_credentials.html", context)
+            elif credential.credential_type == Credentials.CredentialTypes.SARVAM:
+                return render(request, "projects/partials/sarvam_credentials.html", context)
             elif credential.credential_type == Credentials.CredentialTypes.GOOGLE_TTS:
                 return render(request, "projects/partials/google_tts_credentials.html", context)
+            elif credential.credential_type == Credentials.CredentialTypes.TEAMS_BOT_LOGIN:
+                return render(request, "projects/partials/teams_bot_login_credentials.html", context)
             else:
                 return HttpResponse("Cannot render the partial for this credential type", status=400)
 
@@ -218,6 +241,10 @@ class ProjectCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
 
         assembly_ai_credentials = Credentials.objects.filter(project=project, credential_type=Credentials.CredentialTypes.ASSEMBLY_AI).first()
 
+        sarvam_credentials = Credentials.objects.filter(project=project, credential_type=Credentials.CredentialTypes.SARVAM).first()
+
+        teams_bot_login_credentials = Credentials.objects.filter(project=project, credential_type=Credentials.CredentialTypes.TEAMS_BOT_LOGIN).first()
+
         context = self.get_project_context(object_id, project)
         context.update(
             {
@@ -233,6 +260,10 @@ class ProjectCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                 "openai_credential_type": Credentials.CredentialTypes.OPENAI,
                 "assembly_ai_credentials": assembly_ai_credentials.get_credentials() if assembly_ai_credentials else None,
                 "assembly_ai_credential_type": Credentials.CredentialTypes.ASSEMBLY_AI,
+                "sarvam_credentials": sarvam_credentials.get_credentials() if sarvam_credentials else None,
+                "sarvam_credential_type": Credentials.CredentialTypes.SARVAM,
+                "teams_bot_login_credentials": teams_bot_login_credentials.get_credentials() if teams_bot_login_credentials else None,
+                "teams_bot_login_credential_type": Credentials.CredentialTypes.TEAMS_BOT_LOGIN,
             }
         )
 
@@ -311,6 +342,9 @@ class ProjectBotsView(LoginRequiredMixin, ProjectUrlContextMixin, ListView):
         # Add flag to detect if create modal should be automatically opened
         context["open_create_modal"] = self.request.GET.get("open_create_modal") == "true"
 
+        # Check if any bots in the current page have a join_at value
+        context["has_scheduled_bots"] = any(bot.join_at is not None for bot in context["bots"])
+
         return context
 
 
@@ -330,8 +364,31 @@ class ProjectBotDetailView(LoginRequiredMixin, ProjectUrlContextMixin, View):
         # Prefetch bot events with their debug screenshots
         bot.bot_events.prefetch_related("debug_screenshots")
 
-        # Get webhook delivery attempts for this bot
+        # Get webhook delivery attempts for this bot (from both project-level and bot-specific webhook subscriptions)
         webhook_delivery_attempts = WebhookDeliveryAttempt.objects.filter(bot=bot).select_related("webhook_subscription").order_by("-created_at")
+
+        # Get chat messages for this bot
+        chat_messages = ChatMessage.objects.filter(bot=bot).select_related("participant").order_by("created_at")
+
+        # Get participants and participant events for this bot
+        participants = Participant.objects.filter(bot=bot, is_the_bot=False).prefetch_related("events").order_by("created_at")
+
+        # Get resource snapshots for this bot
+        resource_snapshots = bot.resource_snapshots.all().order_by("created_at")
+
+        # Calculate maximum values from resource snapshots
+        max_ram_usage = 0
+        max_cpu_usage = 0
+        if resource_snapshots.exists():
+            for snapshot in resource_snapshots:
+                data = snapshot.data
+                ram_usage = data.get("ram_usage_megabytes", 0)
+                cpu_usage = data.get("cpu_usage_millicores", 0)
+
+                if ram_usage > max_ram_usage:
+                    max_ram_usage = ram_usage
+                if cpu_usage > max_cpu_usage:
+                    max_cpu_usage = cpu_usage
 
         context = self.get_project_context(object_id, project)
         context.update(
@@ -339,10 +396,17 @@ class ProjectBotDetailView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                 "bot": bot,
                 "BotStates": BotStates,
                 "RecordingStates": RecordingStates,
+                "RecordingTranscriptionStates": RecordingTranscriptionStates,
                 "recordings": generate_recordings_json_for_bot_detail_view(bot),
                 "webhook_delivery_attempts": webhook_delivery_attempts,
+                "chat_messages": chat_messages,
+                "participants": participants,
+                "ParticipantEventTypes": ParticipantEventTypes,
                 "WebhookDeliveryAttemptStatus": WebhookDeliveryAttemptStatus,
                 "credits_consumed": -sum([t.credits_delta() for t in bot.credit_transactions.all()]) if bot.credit_transactions.exists() else None,
+                "resource_snapshots": resource_snapshots,
+                "max_ram_usage": max_ram_usage,
+                "max_cpu_usage": max_cpu_usage,
             }
         )
 
@@ -352,17 +416,68 @@ class ProjectBotDetailView(LoginRequiredMixin, ProjectUrlContextMixin, View):
 class ProjectWebhooksView(LoginRequiredMixin, ProjectUrlContextMixin, View):
     def get(self, request, object_id):
         project = get_object_or_404(Project, object_id=object_id, organization=request.user.organization)
+
+        # Get or create webhook secret for the project
+        webhook_secret, created = WebhookSecret.objects.get_or_create(project=project)
+
         context = self.get_project_context(object_id, project)
-        context["webhooks"] = WebhookSubscription.objects.filter(project=project).order_by("-created_at")
+        # Only show project-level webhooks, not bot-level ones
+        context["webhooks"] = project.webhook_subscriptions.filter(bot__isnull=True).order_by("-created_at")
         context["webhook_options"] = [trigger_type for trigger_type in WebhookTriggerTypes]
+        context["webhook_secret"] = base64.b64encode(webhook_secret.get_secret()).decode("utf-8")
         return render(request, "projects/project_webhooks.html", context)
 
 
-class ProjectProjectAndTeamView(LoginRequiredMixin, ProjectUrlContextMixin, View):
+class ProjectProjectView(LoginRequiredMixin, ProjectUrlContextMixin, View):
     def get(self, request, object_id):
         project = get_object_or_404(Project, object_id=object_id, organization=request.user.organization)
         context = self.get_project_context(object_id, project)
-        return render(request, "projects/project_project_and_team.html", context)
+        return render(request, "projects/project_project.html", context)
+
+
+class ProjectTeamView(LoginRequiredMixin, ProjectUrlContextMixin, View):
+    def get(self, request, object_id):
+        project = get_object_or_404(Project, object_id=object_id, organization=request.user.organization)
+
+        # Get all users in the organization with invited_by data
+        users = request.user.organization.users.select_related("invited_by").all()
+
+        context = self.get_project_context(object_id, project)
+        context["users"] = users
+        return render(request, "projects/project_team.html", context)
+
+
+class InviteUserView(LoginRequiredMixin, ProjectUrlContextMixin, View):
+    def get(self, request, object_id):
+        project = get_object_or_404(Project, object_id=object_id, organization=request.user.organization)
+        context = self.get_project_context(object_id, project)
+        return render(request, "projects/project_team.html", context)
+
+    def post(self, request, object_id):
+        get_object_or_404(Project, object_id=object_id, organization=request.user.organization)
+        email = request.POST.get("email")
+
+        if not email:
+            return HttpResponse("Email is required", status=400)
+
+        # Check if user already exists
+        if User.objects.filter(email=email).exists():
+            return HttpResponse("A user with this email already exists", status=400)
+
+        try:
+            with transaction.atomic():
+                # Create the user
+                user = User.objects.create_user(email=email, username=str(uuid.uuid4()), organization=request.user.organization, invited_by=request.user, is_active=True)
+
+                # Send verification email
+                send_email_confirmation(request, user, email=email)
+
+                # Return success response
+                return HttpResponse("Invitation sent successfully", status=200)
+
+        except Exception as e:
+            logger.error(f"Error creating invited user: {str(e)}")
+            return HttpResponse("An error occurred while sending the invitation", status=500)
 
 
 class CreateWebhookView(LoginRequiredMixin, ProjectUrlContextMixin, View):
@@ -371,39 +486,22 @@ class CreateWebhookView(LoginRequiredMixin, ProjectUrlContextMixin, View):
         url = request.POST.get("url")
         triggers = request.POST.getlist("triggers[]")
 
-        # Check if URL is valid
-        if not url.startswith("https://"):
-            return HttpResponse("URL must start with https://", status=400)
-        if WebhookSubscription.objects.filter(url=url, project=project).exists():
-            return HttpResponse("URL already subscribed", status=400)
-        # There is a limit of 2 webhooks per projects for now
-        if WebhookSubscription.objects.filter(project=project).count() >= 7:
-            return HttpResponse("You have reached the maximum number of webhooks", status=400)
+        # Create webhook subscription using shared function
+        try:
+            create_webhook_subscription(url, triggers, project, bot=None)
+        except ValidationError as e:
+            return HttpResponse(e.messages[0], status=400)
 
-        # Check the event is subscribable
-        subscribed_triggers = [int(x) for x in triggers]
-        for trigger in subscribed_triggers:
-            if trigger not in [trigger.value for trigger in WebhookTriggerTypes]:
-                return HttpResponse(f"Invalid event type: {trigger}", status=400)
+        # Get the project's webhook secret for response
+        webhook_secret = WebhookSecret.objects.get(project=project)
 
-        # Get the project's secret for the webhook subscription. If new project, create a new one
-        webhook_secret, created = WebhookSecret.objects.get_or_create(project=project)
-
-        # Create the webhook subscription
-        WebhookSubscription.objects.create(
-            project=project,
-            url=url,
-            triggers=subscribed_triggers,
-        )
-
-        # Render the success modal content
         return render(
             request,
             "projects/partials/webhook_subscription_created_modal.html",
             {
                 "secret": base64.b64encode(webhook_secret.get_secret()).decode("utf-8"),
                 "url": url,
-                "triggers": [WebhookTriggerTypes.trigger_type_to_api_code(x) for x in subscribed_triggers],
+                "triggers": triggers,
             },
         )
 
@@ -417,7 +515,7 @@ class DeleteWebhookView(LoginRequiredMixin, ProjectUrlContextMixin, View):
         )
         webhook.delete()
         context = self.get_project_context(object_id, webhook.project)
-        context["webhooks"] = WebhookSubscription.objects.filter(project=webhook.project).order_by("-created_at")
+        context["webhooks"] = WebhookSubscription.objects.filter(project=webhook.project, bot__isnull=True).order_by("-created_at")
         context["webhook_options"] = [trigger_type for trigger_type in WebhookTriggerTypes]
         return render(request, "projects/project_webhooks.html", context)
 

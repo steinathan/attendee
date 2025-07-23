@@ -149,6 +149,11 @@ class StyleManager {
  
          this.mixedAudioTrack = destination.stream.getAudioTracks()[0];
 
+        // Process and send mixed audio if enabled
+        if (window.initialData.sendMixedAudio && this.mixedAudioTrack) {
+            this.processMixedAudioTrack();
+        }
+
         // Clear any existing interval
         if (this.silenceCheckInterval) {
             clearInterval(this.silenceCheckInterval);
@@ -178,6 +183,98 @@ class StyleManager {
         }, 5000);
     }
     
+    async processMixedAudioTrack() {
+        try {
+            // Create processor to get raw audio frames from the mixed audio track
+            const processor = new MediaStreamTrackProcessor({ track: this.mixedAudioTrack });
+            const generator = new MediaStreamTrackGenerator({ kind: 'audio' });
+            
+            // Get readable stream of audio frames
+            const readable = processor.readable;
+            const writable = generator.writable;
+
+            // Transform stream to intercept and send audio frames
+            const transformStream = new TransformStream({
+                async transform(frame, controller) {
+                    if (!frame) {
+                        return;
+                    }
+
+                    try {
+                        // Check if controller is still active
+                        if (controller.desiredSize === null) {
+                            frame.close();
+                            return;
+                        }
+
+                        // Copy the audio data
+                        const numChannels = frame.numberOfChannels;
+                        const numSamples = frame.numberOfFrames;
+                        const audioData = new Float32Array(numSamples);
+                        
+                        // Copy data from each channel
+                        // If multi-channel, average all channels together to create mono output
+                        if (numChannels > 1) {
+                            // Temporary buffer to hold each channel's data
+                            const channelData = new Float32Array(numSamples);
+                            
+                            // Sum all channels
+                            for (let channel = 0; channel < numChannels; channel++) {
+                                frame.copyTo(channelData, { planeIndex: channel });
+                                for (let i = 0; i < numSamples; i++) {
+                                    audioData[i] += channelData[i];
+                                }
+                            }
+                            
+                            // Average by dividing by number of channels
+                            for (let i = 0; i < numSamples; i++) {
+                                audioData[i] /= numChannels;
+                            }
+                        } else {
+                            // If already mono, just copy the data
+                            frame.copyTo(audioData, { planeIndex: 0 });
+                        }
+
+                        // Send mixed audio data via websocket
+                        const timestamp = performance.now();
+                        window.ws.sendMixedAudio(timestamp, audioData);
+                        
+                        // Pass through the original frame
+                        controller.enqueue(frame);
+                    } catch (error) {
+                        console.error('Error processing mixed audio frame:', error);
+                        frame.close();
+                    }
+                },
+                flush() {
+                    console.log('Mixed audio transform stream flush called');
+                }
+            });
+
+            // Create an abort controller for cleanup
+            const abortController = new AbortController();
+
+            try {
+                // Connect the streams
+                await readable
+                    .pipeThrough(transformStream)
+                    .pipeTo(writable, {
+                        signal: abortController.signal
+                    })
+                    .catch(error => {
+                        if (error.name !== 'AbortError') {
+                            console.error('Mixed audio pipeline error:', error);
+                        }
+                    });
+            } catch (error) {
+                console.error('Mixed audio stream pipeline error:', error);
+                abortController.abort();
+            }
+
+        } catch (error) {
+            console.error('Error setting up mixed audio processor:', error);
+        }
+    }
 
     stop() {
         this.showAllOfGMeetUI();
@@ -544,6 +641,7 @@ class UserManager {
         this.allUsersMap = new Map();
         this.currentUsersMap = new Map();
         this.deviceOutputMap = new Map();
+        this.currentUserId = null;
 
         this.ws = ws;
     }
@@ -635,9 +733,15 @@ class UserManager {
                 7: 'removed_from_meeting'
             }
 
+            const { isCurrentUserString, ...userWithoutIsCurrentUserString } = user;
+            if (isCurrentUserString && this.currentUserId === null) {
+                this.currentUserId = user.deviceId;
+            }
+
             return {
-                ...user,
-                humanized_status: userStatusMap[user.status] || "unknown"
+                ...userWithoutIsCurrentUserString,
+                humanized_status: userStatusMap[user.status] || "unknown",
+                isCurrentUser: user.deviceId === this.currentUserId
             }
         })
         // Get the current user IDs before updating
@@ -658,7 +762,8 @@ class UserManager {
                 profile: user.profile,
                 status: user.status,
                 humanized_status: user.humanized_status,
-                parentDeviceId: user.parentDeviceId
+                parentDeviceId: user.parentDeviceId,
+                isCurrentUser: user.isCurrentUser
             });
         }
 
@@ -678,7 +783,8 @@ class UserManager {
                 profilePicture: user.profilePicture,
                 status: user.status,
                 humanized_status: user.humanized_status,
-                parentDeviceId: user.parentDeviceId
+                parentDeviceId: user.parentDeviceId,
+                isCurrentUser: user.isCurrentUser
             });
         }
 
@@ -965,33 +1071,26 @@ class WebSocketClient {
     }
   }
 
-  sendMixedAudio(timestamp, streamId, audioData) {
+  sendMixedAudio(timestamp, audioData) {
       if (this.ws.readyState !== WebSocket.OPEN) {
           console.error('WebSocket is not connected for audio send', this.ws.readyState);
           return;
       }
-
 
       if (!this.mediaSendingEnabled) {
         return;
       }
 
       try {
-          // Create final message: type (4 bytes) + timestamp (8 bytes) + audio data
-          const message = new Uint8Array(4 + 8 + 4 + audioData.buffer.byteLength);
+          // Create final message: type (4 bytes) + audio data
+          const message = new Uint8Array(4 + audioData.buffer.byteLength);
           const dataView = new DataView(message.buffer);
           
           // Set message type (3 for AUDIO)
           dataView.setInt32(0, WebSocketClient.MESSAGE_TYPES.AUDIO, true);
           
-          // Set timestamp as BigInt64
-          dataView.setBigInt64(4, BigInt(timestamp), true);
-
-          // Set streamId length and bytes
-          dataView.setInt32(12, streamId, true);
-
-          // Copy audio data after type and timestamp
-          message.set(new Uint8Array(audioData.buffer), 16);
+          // Copy audio data after type
+          message.set(new Uint8Array(audioData.buffer), 4);
           
           // Send the binary message
           this.ws.send(message.buffer);
@@ -1197,6 +1296,7 @@ const messageTypes = [
             { name: 'fullName', fieldNumber: 2, type: 'string' },
             { name: 'profilePicture', fieldNumber: 3, type: 'string' },
             { name: 'status', fieldNumber: 4, type: 'varint' }, // in meeting = 1 vs not in meeting = 6. kicked out = 7?
+            { name: 'isCurrentUserString', fieldNumber: 7, type: 'string' }, // Presence of this string indicates that this is the current user. The string itself seems to be a random uuid
             { name: 'displayName', fieldNumber: 29, type: 'string' },
             { name: 'parentDeviceId', fieldNumber: 21, type: 'string' } // if this is present, then this is a screenshare device. The parentDevice is the person that is sharing
         ]
@@ -1603,18 +1703,29 @@ const handleAudioTrack = async (event) => {
                 }
 
                 const contributingSources = receiverManager.getContributingSources(receiver);
-                const usersForContributingSources = contributingSources.map(source => userManager.getUserByStreamId(source.source.toString())).filter(x => x);
+
+                const usersForContributingSourcesWithAudioLevel = contributingSources.map(source => {
+                    return {
+                        audioLevel: source?.audioLevel || 0, 
+                        user: userManager.getUserByStreamId(source.source.toString())
+                    }
+                }).filter(x => x.user).sort((a, b) => b.audioLevel - a.audioLevel);
+
+                const userForContributingSourceWithLoudestAudio = usersForContributingSourcesWithAudioLevel[0]?.user;
+
+
                 //console.log('contributingSources', contributingSources);
                 //console.log('deviceOutputMap', userManager.deviceOutputMap);
                 //console.log('usersForContributingSources', usersForContributingSources);
 
                 // Send audio data through websocket
-                if (usersForContributingSources.length === 1) {
-                    const firstUserId = usersForContributingSources[0]?.deviceId;
+                if (userForContributingSourceWithLoudestAudio) {
+                    const firstUserId = userForContributingSourceWithLoudestAudio?.deviceId;
                     if (firstUserId) {
                         ws.sendPerParticipantAudio(firstUserId, audioData);
                     }
                 }
+                
                 // Pass through the original frame
                 controller.enqueue(frame);
             } catch (error) {

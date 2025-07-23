@@ -29,6 +29,11 @@ class UiMeetingNotFoundException(UiException):
         super().__init__(message, step, inner_exception)
 
 
+class UiIncorrectPasswordException(UiException):
+    def __init__(self, message, step=None, inner_exception=None):
+        super().__init__(message, step, inner_exception)
+
+
 class UiRetryableException(UiException):
     def __init__(self, message, step=None, inner_exception=None):
         super().__init__(message, step, inner_exception)
@@ -45,5 +50,15 @@ class UiCouldNotLocateElementException(UiRetryableException):
 
 
 class UiCouldNotClickElementException(UiRetryableException):
+    def __init__(self, message, step=None, inner_exception=None):
+        super().__init__(message, step, inner_exception)
+
+
+class UiLoginRequiredException(UiException):
+    def __init__(self, message, step=None, inner_exception=None):
+        super().__init__(message, step, inner_exception)
+
+
+class UiLoginAttemptFailedException(UiException):
     def __init__(self, message, step=None, inner_exception=None):
         super().__init__(message, step, inner_exception)

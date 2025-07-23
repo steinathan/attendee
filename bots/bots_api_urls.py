@@ -69,6 +69,11 @@ urlpatterns = [
         bots_api_views.ResumeRecordingView.as_view(),
         name="bot-resume-recording",
     ),
+    path(
+        "bots/<str:object_id>/participant_events",
+        bots_api_views.ParticipantEventsView.as_view(),
+        name="bot-participant-events",
+    ),
 ]
 
 # catch any other paths and return a 404 json response - must be last

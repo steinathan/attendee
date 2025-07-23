@@ -128,3 +128,12 @@ $50 in free credits for new users.
 ### OpenAI
 
 Cheaper then the other providers, but less accurate and often chooses the wrong language when the language is not specified in advance. Can transcribe audio where the speaker is switching languages in the middle of a sentence. Lacks word-level timestamps.
+
+#### Note on custom OpenAI proxy servers
+
+To use a custom OpenAI-compatible endpoint (such as a proxy server or alternative model provider), set these environment variables:
+
+- `OPENAI_BASE_URL`: The base URL for your custom endpoint (default: `https://api.openai.com/v1`)
+- `OPENAI_MODEL_NAME`: The model name to use for transcription (default: `gpt-4o-transcribe`)
+
+Example: `OPENAI_BASE_URL=https://your-proxy.com/v1` and `OPENAI_MODEL_NAME=whisper-large-v3`

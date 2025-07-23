@@ -24,6 +24,56 @@ class BotEventInline(admin.TabularInline):
         return False
 
 
+class HasBotFilter(admin.SimpleListFilter):
+    title = "has bot"
+    parameter_name = "has_bot"
+
+    def lookups(self, request, model_admin):
+        return (
+            ("yes", "Has Bot"),
+            ("no", "No Bot"),
+        )
+
+    def queryset(self, request, queryset):
+        if self.value() == "yes":
+            return queryset.filter(bot__isnull=False)
+        if self.value() == "no":
+            return queryset.filter(bot__isnull=True)
+        return queryset
+
+
+@admin.register(BotEvent)
+class BotEventAdmin(admin.ModelAdmin):
+    list_display = ("bot_object_id", "event_type", "event_sub_type", "old_state", "new_state", "created_at")
+    list_filter = ("event_type", "event_sub_type", "old_state", "new_state")
+    search_fields = ("bot__object_id",)
+    readonly_fields = ("bot", "created_at", "old_state", "new_state", "event_type", "event_sub_type", "metadata", "requested_bot_action_taken_at", "version")
+    ordering = ("-created_at",)
+
+    def bot_object_id(self, obj):
+        return obj.bot.object_id
+
+    bot_object_id.short_description = "Bot"
+    bot_object_id.admin_order_field = "bot__object_id"
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return True
+
+    # Optional: organize fields in the detail view
+    fieldsets = (
+        ("Event Information", {"fields": ("bot", "event_type", "event_sub_type", "created_at")}),
+        ("State Transition", {"fields": ("old_state", "new_state")}),
+        ("Additional Data", {"fields": ("metadata", "requested_bot_action_taken_at")}),
+        ("System", {"fields": ("version",)}),
+    )
+
+
 @admin.register(Bot)
 class BotAdmin(admin.ModelAdmin):
     actions = None
@@ -57,7 +107,7 @@ class BotAdmin(admin.ModelAdmin):
 
     # Optional: if you want to organize the fields in the detail view
     fieldsets = (
-        ("Basic Information", {"fields": ("object_id", "name", "project", "join_at")}),
+        ("Basic Information", {"fields": ("object_id", "name", "project", "join_at", "deduplication_key")}),
         ("Meeting Details", {"fields": ("meeting_url", "meeting_uuid")}),
         ("Status", {"fields": ("state", "view_logs_link")}),
         ("Settings", {"fields": ("settings",)}),
@@ -145,8 +195,8 @@ class WebhookDeliveryAttemptAdmin(admin.ModelAdmin):
 
 @admin.register(WebhookSubscription)
 class WebhookSubscriptionAdmin(admin.ModelAdmin):
-    list_display = ("url", "project", "is_active", "created_at")
-    list_filter = ("is_active", "project")
+    list_display = ("url", "project", "bot", "is_active", "created_at")
+    list_filter = ("is_active", "project", HasBotFilter)
     search_fields = ("url", "project__name")
     readonly_fields = ("object_id",)
 

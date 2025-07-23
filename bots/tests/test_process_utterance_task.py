@@ -5,6 +5,7 @@ from django.test import TransactionTestCase
 
 from bots.models import (
     Bot,
+    Credentials,
     Organization,
     Participant,
     Project,
@@ -14,7 +15,7 @@ from bots.models import (
     TranscriptionFailureReasons,
     Utterance,
 )
-from bots.tasks.process_utterance_task import process_utterance
+from bots.tasks.process_utterance_task import get_transcription_via_assemblyai, get_transcription_via_deepgram, get_transcription_via_gladia, get_transcription_via_openai, get_transcription_via_sarvam, process_utterance
 
 
 class ProcessUtteranceTaskTest(TransactionTestCase):
@@ -132,11 +133,6 @@ import types
 from unittest import mock
 
 from django.test import TransactionTestCase
-
-from bots.models import (
-    Credentials,
-)
-from bots.tasks.process_utterance_task import get_transcription_via_deepgram
 
 
 def _build_fake_deepgram(success=True, err_code=None):
@@ -265,7 +261,43 @@ from django.test import TransactionTestCase
 from bots.models import (
     Credentials as CredModel,
 )
-from bots.tasks.process_utterance_task import get_transcription_via_gladia
+
+
+class BotModelTest(TransactionTestCase):
+    """Unit tests for Bot model methods related to OpenAI transcription configuration"""
+
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org")
+        self.project = Project.objects.create(name="Proj", organization=self.org)
+        self.bot = Bot.objects.create(project=self.project, meeting_url="https://zoom.us/j/test")
+
+    @mock.patch.dict("os.environ", {}, clear=True)
+    def test_openai_transcription_model_default_without_env(self):
+        """Test that the default model is used when no env var or settings are present"""
+        model = self.bot.openai_transcription_model()
+        self.assertEqual(model, "gpt-4o-transcribe")
+
+    @mock.patch.dict("os.environ", {"OPENAI_MODEL_NAME": "custom-env-model"})
+    def test_openai_transcription_model_env_var_fallback(self):
+        """Test that env var is used as fallback when no bot settings are present"""
+        model = self.bot.openai_transcription_model()
+        self.assertEqual(model, "custom-env-model")
+
+    @mock.patch.dict("os.environ", {"OPENAI_MODEL_NAME": "custom-env-model"})
+    def test_openai_transcription_model_settings_override_env(self):
+        """Test that bot settings override env var"""
+        self.bot.settings = {"transcription_settings": {"openai": {"model": "settings-model"}}}
+        self.bot.save()
+        model = self.bot.openai_transcription_model()
+        self.assertEqual(model, "settings-model")
+
+    @mock.patch.dict("os.environ", {}, clear=True)
+    def test_openai_transcription_model_settings_override_default(self):
+        """Test that bot settings override default"""
+        self.bot.settings = {"transcription_settings": {"openai": {"model": "settings-model"}}}
+        self.bot.save()
+        model = self.bot.openai_transcription_model()
+        self.assertEqual(model, "settings-model")
 
 
 class GladiaProviderTest(TransactionTestCase):
@@ -394,8 +426,6 @@ from unittest import mock
 
 from django.test import TransactionTestCase
 
-from bots.tasks.process_utterance_task import get_transcription_via_openai
-
 
 class OpenAIProviderTest(TransactionTestCase):
     """Unit‑tests for get_transcription_via_openai"""
@@ -485,12 +515,127 @@ class OpenAIProviderTest(TransactionTestCase):
         self.assertIsNone(tx)
         self.assertEqual(failure, {"reason": TranscriptionFailureReasons.CREDENTIALS_NOT_FOUND})
 
+    # ────────────────────────────────────────────────────────────────────────────────
+    @mock.patch("bots.tasks.process_utterance_task.requests.post")
+    @mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3")
+    @mock.patch.dict("os.environ", {"OPENAI_BASE_URL": "https://custom.openai.com/v1"})
+    def test_custom_base_url_from_env(self, mock_pcm, mock_post):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"text": "custom endpoint!"}
+        with mock.patch.object(self.creds.__class__, "get_credentials", return_value={"api_key": "sk‑XYZ"}):
+            tx, failure = get_transcription_via_openai(self.utt)
 
-from unittest import mock
+        self.assertIsNone(failure)
+        self.assertEqual(tx, {"transcript": "custom endpoint!"})
+        # Verify that the custom base URL was used
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        self.assertEqual(call_args[0][0], "https://custom.openai.com/v1/audio/transcriptions")
 
-from django.test import TransactionTestCase
+    # ────────────────────────────────────────────────────────────────────────────────
+    @mock.patch("bots.tasks.process_utterance_task.requests.post")
+    @mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3")
+    @mock.patch.dict("os.environ", {"OPENAI_MODEL_NAME": "custom-model"})
+    def test_custom_model_name_from_env(self, mock_pcm, mock_post):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"text": "custom model!"}
+        with mock.patch.object(self.creds.__class__, "get_credentials", return_value={"api_key": "sk‑XYZ"}):
+            tx, failure = get_transcription_via_openai(self.utt)
 
-from bots.tasks.process_utterance_task import get_transcription_via_assemblyai
+        self.assertIsNone(failure)
+        self.assertEqual(tx, {"transcript": "custom model!"})
+        # Verify that the custom model name was used
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        files_dict = call_args[1]["files"]
+        self.assertEqual(files_dict["model"][1], "custom-model")
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    @mock.patch("bots.tasks.process_utterance_task.requests.post")
+    @mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3")
+    @mock.patch.dict("os.environ", {"OPENAI_BASE_URL": "https://custom-ai-endpoint.example.com/v1", "OPENAI_MODEL_NAME": "gpt-4-turbo-transcribe"})
+    def test_both_env_vars_together(self, mock_pcm, mock_post):
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"text": "both custom!"}
+        with mock.patch.object(self.creds.__class__, "get_credentials", return_value={"api_key": "sk‑XYZ"}):
+            tx, failure = get_transcription_via_openai(self.utt)
+
+        self.assertIsNone(failure)
+        self.assertEqual(tx, {"transcript": "both custom!"})
+        # Verify both custom values were used
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        print("call_args", call_args)
+        self.assertEqual(call_args[0][0], "https://custom-ai-endpoint.example.com/v1/audio/transcriptions")
+        files_dict = call_args[1]["files"]
+        self.assertEqual(files_dict["model"][1], "gpt-4-turbo-transcribe")
+
+
+class OpenAIModelValidationTest(TransactionTestCase):
+    """Tests for OpenAI model validation in serializers"""
+
+    def setUp(self):
+        self.organization = Organization.objects.create(name="Test Organization")
+        self.project = Project.objects.create(name="Test Project", organization=self.organization)
+
+    @mock.patch.dict("os.environ", {}, clear=True)
+    def test_get_openai_model_enum_default(self):
+        """Test that default models are returned when no env var is set"""
+        from bots.serializers import get_openai_model_enum
+
+        models = get_openai_model_enum()
+        expected = ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"]
+        self.assertEqual(models, expected)
+
+    @mock.patch.dict("os.environ", {"OPENAI_MODEL_NAME": "custom-whisper-model"})
+    def test_get_openai_model_enum_custom_model(self):
+        """Test that custom model is added to enum when env var is set"""
+        from bots.serializers import get_openai_model_enum
+
+        models = get_openai_model_enum()
+        expected = ["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "custom-whisper-model"]
+        self.assertEqual(models, expected)
+
+    @mock.patch.dict("os.environ", {}, clear=True)
+    def test_transcription_settings_validation_default_models(self):
+        """Test that default OpenAI models are accepted in validation"""
+        from bots.serializers import CreateBotSerializer
+
+        # Provide initial data with a meeting URL that supports OpenAI transcription
+        data = {
+            "meeting_url": "https://zoom.us/j/123456789",
+            "bot_name": "Test Bot",
+        }
+        serializer = CreateBotSerializer(data=data)
+
+        valid_settings = {"openai": {"model": "gpt-4o-transcribe"}}
+        validated = serializer.validate_transcription_settings(valid_settings)
+        self.assertEqual(validated["openai"]["model"], "gpt-4o-transcribe")
+
+    @mock.patch("bots.serializers.os.getenv")
+    def test_transcription_settings_validation_custom_model(self, mock_getenv):
+        """Test that custom model from env var is accepted in validation"""
+        mock_getenv.side_effect = lambda key, default=None: {
+            "OPENAI_MODEL_NAME": "custom-whisper-model",
+        }.get(key, default)
+
+        # Import and reload the serializers module to pick up the mocked getenv
+        import importlib
+
+        from bots import serializers
+
+        importlib.reload(serializers)
+
+        # Provide initial data with a meeting URL that supports OpenAI transcription
+        data = {
+            "meeting_url": "https://zoom.us/j/123456789",
+            "bot_name": "Test Bot",
+        }
+        serializer = serializers.CreateBotSerializer(data=data)
+
+        valid_settings = {"openai": {"model": "custom-whisper-model"}}
+        validated = serializer.validate_transcription_settings(valid_settings)
+        self.assertEqual(validated["openai"]["model"], "custom-whisper-model")
 
 
 class AssemblyAIProviderTest(TransactionTestCase):
@@ -672,3 +817,149 @@ class AssemblyAIProviderTest(TransactionTestCase):
             self.assertEqual(failure["reason"], TranscriptionFailureReasons.TIMED_OUT)
             # The code has max_retries = 120
             self.assertEqual(m_get.call_count, 120)
+
+    def test_keyterms_prompt_and_speech_model_included(self):
+        """Test that keyterms_prompt and speech_model are included in the AssemblyAI request if set in settings."""
+        self.bot.settings = {
+            "transcription_settings": {
+                "assembly_ai": {
+                    "keyterms_prompt": ["aws", "azure", "google cloud"],
+                    "speech_model": "slam-1",
+                }
+            }
+        }
+        self.bot.save()
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+            mock.patch("bots.tasks.process_utterance_task.requests.get") as m_get,
+            mock.patch("bots.tasks.process_utterance_task.requests.delete") as m_delete,
+        ):
+            # 1. Mock upload response
+            upload_response = mock.Mock(status_code=200)
+            upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/upload/123"}
+
+            # 2. Mock transcript creation response
+            transcript_response = mock.Mock(status_code=200)
+            transcript_response.json.return_value = {"id": "transcript-abc"}
+
+            m_post.side_effect = [upload_response, transcript_response]
+
+            # 3. Mock polling responses
+            done_response = mock.Mock(status_code=200)
+            done_response.json.return_value = {
+                "status": "completed",
+                "text": "hello assembly",
+                "words": [],
+            }
+            m_get.return_value = done_response
+
+            # 4. Mock delete response
+            delete_response = mock.Mock(status_code=200)
+            m_delete.return_value = delete_response
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            self.assertIsNone(failure)
+            self.assertEqual(transcript["transcript"], "hello assembly")
+
+            # Check that the transcript creation request included keyterms_prompt and speech_model
+            # The second call to requests.post is the transcript creation
+            transcript_call = m_post.call_args_list[1]
+            _, kwargs = transcript_call
+            data = kwargs["json"]
+            self.assertIn("keyterms_prompt", data)
+            self.assertEqual(data["keyterms_prompt"], ["aws", "azure", "google cloud"])
+            self.assertIn("speech_model", data)
+            self.assertEqual(data["speech_model"], "slam-1")
+
+
+from unittest import mock
+
+from django.test import TransactionTestCase
+
+
+class SarvamProviderTest(TransactionTestCase):
+    """Unit‑tests for bots.tasks.process_utterance_task.get_transcription_via_sarvam"""
+
+    def setUp(self):
+        # Minimal DB fixtures
+        self.org = Organization.objects.create(name="Org")
+        self.project = Project.objects.create(name="Proj", organization=self.org)
+        self.bot = Bot.objects.create(project=self.project, meeting_url="https://zoom.us/j/999")
+
+        self.recording = Recording.objects.create(
+            bot=self.bot,
+            recording_type=1,
+            transcription_type=1,
+            state=RecordingStates.COMPLETE,
+            transcription_provider=6,  # SARVAM
+        )
+
+        self.participant = Participant.objects.create(bot=self.bot, uuid="p1")
+        self.utterance = Utterance.objects.create(
+            recording=self.recording,
+            participant=self.participant,
+            audio_blob=b"pcm-bytes",
+            timestamp_ms=0,
+            duration_ms=600,
+            sample_rate=16_000,
+        )
+        self.utterance.refresh_from_db()
+        self.cred = Credentials.objects.create(
+            project=self.project,
+            credential_type=Credentials.CredentialTypes.SARVAM,
+        )
+
+    def _patch_creds(self):
+        """Always return a fake API key."""
+        return mock.patch.object(Credentials, "get_credentials", return_value={"api_key": "fake-sarvam-key"})
+
+    def test_happy_path(self):
+        """Successful transcription returns formatted transcript."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+        ):
+            success_response = mock.Mock(status_code=200)
+            success_response.json.return_value = {"transcript": "hello sarvam"}
+            m_post.return_value = success_response
+
+            transcript, failure = get_transcription_via_sarvam(self.utterance)
+
+            self.assertIsNone(failure)
+            self.assertEqual(transcript["transcript"], "hello sarvam")
+            m_post.assert_called_once()
+
+    def test_invalid_credentials(self):
+        """Sarvam 403 on request → CREDENTIALS_INVALID."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+        ):
+            resp403 = mock.Mock(status_code=403)
+            m_post.return_value = resp403
+
+            transcript, failure = get_transcription_via_sarvam(self.utterance)
+
+            self.assertIsNone(transcript)
+            self.assertEqual(failure["reason"], TranscriptionFailureReasons.CREDENTIALS_INVALID)
+
+    def test_rate_limit_exceeded(self):
+        """Sarvam 429 on request → RATE_LIMIT_EXCEEDED."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+        ):
+            resp429 = mock.Mock(status_code=429)
+            m_post.return_value = resp429
+
+            transcript, failure = get_transcription_via_sarvam(self.utterance)
+
+            self.assertIsNone(transcript)
+            self.assertEqual(failure["reason"], TranscriptionFailureReasons.RATE_LIMIT_EXCEEDED)
+            self.assertEqual(failure["status_code"], 429)

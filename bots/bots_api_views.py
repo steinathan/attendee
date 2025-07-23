@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 from django.core.exceptions import ValidationError
@@ -32,6 +33,7 @@ from .models import (
     Credentials,
     MediaBlob,
     MeetingTypes,
+    ParticipantEvent,
     Recording,
     Utterance,
 )
@@ -41,6 +43,7 @@ from .serializers import (
     BotSerializer,
     ChatMessageSerializer,
     CreateBotSerializer,
+    ParticipantEventSerializer,
     PatchBotSerializer,
     RecordingSerializer,
     SpeechSerializer,
@@ -264,8 +267,10 @@ class OutputVideoView(APIView):
 
         # Get which type of meeting the bot is in
         meeting_type = meeting_type_from_url(bot.meeting_url)
-        if meeting_type != MeetingTypes.GOOGLE_MEET:
+        if meeting_type != MeetingTypes.GOOGLE_MEET and meeting_type != MeetingTypes.ZOOM:
             # Video output is not supported in this meeting type
+            return Response({"error": "Video output is not supported in this meeting type"}, status=status.HTTP_400_BAD_REQUEST)
+        if meeting_type == MeetingTypes.ZOOM and os.getenv("ENABLE_ZOOM_VIDEO_OUTPUT") != "true":
             return Response({"error": "Video output is not supported in this meeting type"}, status=status.HTTP_400_BAD_REQUEST)
 
         # Validate the request data
@@ -1089,6 +1094,118 @@ class ResumeRecordingView(APIView):
                     {"error": "Failed to resume recording"},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+        except Bot.DoesNotExist:
+            return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class ParticipantEventCursorPagination(CursorPagination):
+    ordering = "created_at"
+    page_size = 25
+
+
+class ParticipantEventsView(GenericAPIView):
+    authentication_classes = [ApiKeyAuthentication]
+    pagination_class = ParticipantEventCursorPagination
+    serializer_class = ParticipantEventSerializer
+
+    @extend_schema(
+        operation_id="Get Participant Events",
+        summary="Get participant events for a bot",
+        description="Returns the participant events (join/leave) for a bot. Results are paginated using cursor pagination.",
+        responses={
+            200: OpenApiResponse(
+                response=ParticipantEventSerializer(many=True),
+                description="List of participant events",
+            ),
+            404: OpenApiResponse(description="Bot not found"),
+        },
+        parameters=[
+            *TokenHeaderParameter,
+            OpenApiParameter(
+                name="object_id",
+                type=str,
+                location=OpenApiParameter.PATH,
+                description="Bot ID",
+                examples=[OpenApiExample("Bot ID Example", value="bot_xxxxxxxxxxx")],
+            ),
+            OpenApiParameter(
+                name="after",
+                type={"type": "string", "format": "ISO 8601 datetime"},
+                location=OpenApiParameter.QUERY,
+                description="Only return participant events created after this time. Useful when polling for updates.",
+                required=False,
+                examples=[OpenApiExample("DateTime Example", value="2024-01-18T12:34:56Z")],
+            ),
+            OpenApiParameter(
+                name="before",
+                type={"type": "string", "format": "ISO 8601 datetime"},
+                location=OpenApiParameter.QUERY,
+                description="Only return participant events created before this time.",
+                required=False,
+                examples=[OpenApiExample("DateTime Example", value="2024-01-18T13:34:56Z")],
+            ),
+            OpenApiParameter(
+                name="cursor",
+                type=str,
+                location=OpenApiParameter.QUERY,
+                description="Cursor for pagination",
+                required=False,
+            ),
+        ],
+        tags=["Bots"],
+    )
+    def get(self, request, object_id):
+        try:
+            # Get the bot and verify it belongs to the project
+            bot = Bot.objects.get(object_id=object_id, project=request.auth.project)
+
+            # Get optional after and before parameters
+            after = request.query_params.get("after")
+            before = request.query_params.get("before")
+
+            # Query participant events for this bot. Do not show events for the bot itself
+            events_query = ParticipantEvent.objects.filter(participant__bot=bot, participant__is_the_bot=False).select_related("participant")
+
+            # Filter by after if provided
+            if after:
+                try:
+                    after_datetime = parse_datetime(str(after))
+                except Exception:
+                    after_datetime = None
+
+                if not after_datetime:
+                    return Response(
+                        {"error": "Invalid after format. Use ISO 8601 format (e.g., 2024-01-18T12:34:56Z)"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                events_query = events_query.filter(created_at__gt=after_datetime)
+
+            # Filter by before if provided
+            if before:
+                try:
+                    before_datetime = parse_datetime(str(before))
+                except Exception:
+                    before_datetime = None
+
+                if not before_datetime:
+                    return Response(
+                        {"error": "Invalid before format. Use ISO 8601 format (e.g., 2024-01-18T12:34:56Z)"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                events_query = events_query.filter(created_at__lt=before_datetime)
+
+            # Apply ordering for cursor pagination
+            events = events_query.order_by("created_at")
+
+            # Let the pagination class handle the rest
+            page = self.paginate_queryset(events)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+
+            serializer = self.get_serializer(events, many=True)
+            return Response(serializer.data)
 
         except Bot.DoesNotExist:
             return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)

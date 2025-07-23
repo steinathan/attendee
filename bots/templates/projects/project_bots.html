@@ -120,6 +120,7 @@
                         <th>Meeting URL</th>
                         <th>Status</th>
                         <th>Last Event</th>
+                        {% if has_scheduled_bots %}<th>Join At</th>{% endif %}
                         <th>Created</th>
                     </tr>
                 </thead>
@@ -152,6 +153,17 @@
                             {% endif %}
                             </small>
                         </td>
+                        {% if has_scheduled_bots %}
+                        <td>
+                            <small>
+                            {% if bot.join_at %}
+                                {{ bot.join_at|date:"M d, Y H:i" }}
+                            {% else %}
+                                -
+                            {% endif %}
+                            </small>
+                        </td>
+                        {% endif %}
                         <td><small>{{ bot.created_at|date:"M d, Y H:i" }}</small></td>
                     </tr>
                     {% endfor %}

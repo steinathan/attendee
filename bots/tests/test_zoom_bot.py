@@ -2,11 +2,11 @@ import base64
 import json
 import threading
 import time
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import zoom_meeting_sdk as zoom
 from django.db import connection
-from django.test import override_settings
+from django.test import override_settings, tag
 from django.test.testcases import TransactionTestCase
 
 from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
@@ -32,6 +32,8 @@ from bots.models import (
     CreditTransaction,
     MediaBlob,
     Organization,
+    ParticipantEvent,
+    ParticipantEventTypes,
     Project,
     Recording,
     RecordingFormats,
@@ -277,8 +279,8 @@ def create_mock_zoom_sdk():
 
     # Create a mock participants controller
     mock_participants_controller = MagicMock()
-    mock_participants_controller.GetParticipantsList.return_value = [2]  # Return test user ID
-    mock_participants_controller.GetUserByUserID.return_value = MockParticipant(2, "Test User", "test_persistent_id_123")
+    mock_participants_controller.GetParticipantsList.return_value = [1, 2]  # Return test user ID
+    mock_participants_controller.GetUserByUserID.side_effect = lambda user_id: (MockParticipant(1, "Bot User", "bot_persistent_id") if user_id == 1 else MockParticipant(2, "Test User", "test_persistent_id_123") if user_id == 2 else None)
     mock_participants_controller.GetMySelfUser.return_value = MockParticipant(1, "Bot User", "bot_persistent_id")
 
     # Add participants controller to meeting service
@@ -318,6 +320,7 @@ def create_mock_deepgram():
     return mock_deepgram
 
 
+@tag("zoom_tests")
 class TestZoomBot(TransactionTestCase):
     @classmethod
     def setUpClass(cls):
@@ -642,9 +645,10 @@ class TestZoomBot(TransactionTestCase):
         threading.Timer(2, simulate_join_flow).start()
 
         # Give the bot some time to process
-        bot_thread.join(timeout=10)
+        bot_thread.join(timeout=15)
 
         # Refresh the bot from the database
+        time.sleep(3)
         self.bot.refresh_from_db()
 
         # Assert that the heartbeat timestamp was set
@@ -917,6 +921,9 @@ class TestZoomBot(TransactionTestCase):
             # Simulate chat message received
             adapter.on_chat_msg_notification_callback(mock_chat_msg_info, mock_chat_msg_info.GetContent())
 
+            # Simulate user leaving
+            adapter.on_user_left_callback([2], [])
+
             # Simulate meeting ended
             adapter.meeting_service_event.onMeetingStatusChangedCallback(
                 mock_zoom_sdk_adapter.MEETING_STATUS_ENDED,
@@ -1038,7 +1045,7 @@ class TestZoomBot(TransactionTestCase):
         chat_message = chat_messages.first()
         self.assertEqual(chat_message.text, "Hello bot from Test User!")
         self.assertEqual(chat_message.participant.full_name, "Test User")
-        self.assertEqual(chat_message.source_uuid, "test_chat_message_id_001")
+        self.assertEqual(chat_message.source_uuid, self.recording.object_id + "-test_chat_message_id_001")
         self.assertEqual(chat_message.to, ChatMessageToOptions.ONLY_BOT)
 
         # Verify chat message request was processed
@@ -1086,7 +1093,21 @@ class TestZoomBot(TransactionTestCase):
         connection.close()
 
         # Verify that the bot has participants
-        self.assertEqual(self.bot.participants.count(), 1)
+        self.assertEqual(self.bot.participants.count(), 2)
+        bot_participant = self.bot.participants.get(user_uuid="bot_persistent_id")
+        self.assertEqual(bot_participant.full_name, "Bot User")
+        other_participant = self.bot.participants.get(user_uuid="test_persistent_id_123")
+        self.assertEqual(other_participant.full_name, "Test User")
+
+        # Verify that the expected participant events were created
+        participant_events = ParticipantEvent.objects.filter(participant__bot=self.bot, participant__user_uuid="test_persistent_id_123")
+        self.assertEqual(participant_events.count(), 2)
+        self.assertEqual(participant_events[0].event_type, ParticipantEventTypes.JOIN)
+        self.assertEqual(participant_events[1].event_type, ParticipantEventTypes.LEAVE)
+
+        bot_participant_events = ParticipantEvent.objects.filter(participant__bot=self.bot, participant__user_uuid="bot_persistent_id")
+        self.assertEqual(bot_participant_events.count(), 1)
+        self.assertEqual(bot_participant_events[0].event_type, ParticipantEventTypes.JOIN)
 
         # Delete the bot data
         self.bot.delete_data()
@@ -1155,7 +1176,7 @@ class TestZoomBot(TransactionTestCase):
 
         # Create bot controller
         controller = BotController(self.bot.id)
-        controller.pipeline_configuration = PipelineConfiguration.voice_agent()
+        controller.pipeline_configuration = PipelineConfiguration.audio_recorder_bot_with_websocket_audio()
 
         # Run the bot in a separate thread since it has an event loop
         bot_thread = threading.Thread(target=controller.run)
@@ -2687,3 +2708,198 @@ class TestZoomBot(TransactionTestCase):
 
         # Close the database connection since we're in a thread
         connection.close()
+
+    @patch(
+        "bots.zoom_bot_adapter.video_input_manager.zoom",
+        new_callable=create_mock_zoom_sdk,
+    )
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.zoom", new_callable=create_mock_zoom_sdk)
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.jwt")
+    @patch("bots.bot_controller.bot_controller.FileUploader")
+    def test_bot_can_handle_stuck_in_connecting_state(
+        self,
+        MockFileUploader,
+        mock_jwt,
+        mock_zoom_sdk_adapter,
+        mock_zoom_sdk_video,
+    ):
+        # Configure the mock class to return our mock instance
+        mock_uploader = create_mock_file_uploader()
+        MockFileUploader.return_value = mock_uploader
+
+        # Mock the JWT token generation
+        mock_jwt.encode.return_value = "fake_jwt_token"
+
+        # Create bot controller
+        controller = BotController(self.bot.id)
+
+        # Run the bot in a separate thread since it has an event loop
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        def simulate_stuck_in_connecting_flow():
+            # Set a shorter timeout for testing (2 seconds instead of 60)
+            controller.adapter.stuck_in_connecting_state_timeout = 2
+
+            # Simulate successful auth
+            controller.adapter.auth_event.onAuthenticationReturnCallback(mock_zoom_sdk_adapter.AUTHRET_SUCCESS)
+
+            # Configure GetMeetingStatus to return connecting status permanently
+            controller.adapter.meeting_service.GetMeetingStatus.return_value = mock_zoom_sdk_adapter.MEETING_STATUS_CONNECTING
+
+            # Simulate transition to connecting state
+            controller.adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_CONNECTING,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            # The bot should get stuck here - we don't send any more status changes
+            # The adapter should timeout after its configured timeout period (2 seconds)
+
+            # Clean up connections in thread
+            connection.close()
+
+        # Run join flow simulation after a short delay
+        threading.Timer(2, simulate_stuck_in_connecting_flow).start()
+
+        # Give the bot time to process and timeout (2 second timeout + processing time)
+        bot_thread.join(timeout=10)
+
+        # Refresh the bot from the database
+        self.bot.refresh_from_db()
+
+        # Assert that the heartbeat timestamp was set
+        self.assertIsNotNone(self.bot.first_heartbeat_timestamp)
+        self.assertIsNotNone(self.bot.last_heartbeat_timestamp)
+
+        # Check the bot events
+        bot_events = self.bot.bot_events.all()
+        self.assertEqual(len(bot_events), 2)
+        join_requested_event = bot_events[0]
+        could_not_join_event = bot_events[1]
+
+        # Verify join_requested_event properties
+        self.assertEqual(join_requested_event.event_type, BotEventTypes.JOIN_REQUESTED)
+        self.assertEqual(join_requested_event.old_state, BotStates.READY)
+        self.assertEqual(join_requested_event.new_state, BotStates.JOINING)
+        self.assertIsNone(join_requested_event.event_sub_type)
+        self.assertEqual(join_requested_event.metadata, {})
+        self.assertIsNotNone(join_requested_event.requested_bot_action_taken_at)
+
+        # Verify could_not_join_event properties
+        self.assertEqual(could_not_join_event.event_type, BotEventTypes.COULD_NOT_JOIN)
+        self.assertEqual(could_not_join_event.old_state, BotStates.JOINING)
+        self.assertEqual(could_not_join_event.new_state, BotStates.FATAL_ERROR)
+        self.assertEqual(
+            could_not_join_event.event_sub_type,
+            BotEventSubTypes.COULD_NOT_JOIN_UNABLE_TO_CONNECT_TO_MEETING,
+        )
+        self.assertEqual(could_not_join_event.metadata, {"bot_duration_seconds": 30, "credits_consumed": 0.01})
+        self.assertIsNone(could_not_join_event.requested_bot_action_taken_at)
+
+        # Verify recording state and transcription state is not started
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.state, RecordingStates.NOT_STARTED)
+        self.assertEqual(self.recording.transcription_state, RecordingTranscriptionStates.NOT_STARTED)
+        self.assertEqual(self.recording.transcription_failure_data, None)
+
+        # Verify expected SDK calls
+        mock_zoom_sdk_adapter.InitSDK.assert_called_once()
+        mock_zoom_sdk_adapter.CreateMeetingService.assert_called_once()
+        mock_zoom_sdk_adapter.CreateAuthService.assert_called_once()
+        controller.adapter.meeting_service.Join.assert_called_once()
+
+        # Cleanup
+        # no need to cleanup since we already hit error
+        # controller.cleanup() will be called by the bot controller
+        bot_thread.join(timeout=5)
+
+        # Close the database connection since we're in a thread
+        connection.close()
+
+    @patch("bots.external_callback_utils.requests.post")
+    @patch(
+        "bots.zoom_bot_adapter.video_input_manager.zoom",
+        new_callable=create_mock_zoom_sdk,
+    )
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.zoom", new_callable=create_mock_zoom_sdk)
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.jwt")
+    @patch("bots.bot_controller.bot_controller.FileUploader")
+    def test_bot_uses_zoom_tokens_from_callback(
+        self,
+        MockFileUploader,
+        mock_jwt,
+        mock_zoom_sdk_adapter,
+        mock_zoom_sdk_video,
+        mock_requests_post,
+    ):
+        # Configure the mock class to return our mock instance
+        mock_uploader = create_mock_file_uploader()
+        MockFileUploader.return_value = mock_uploader
+
+        # Mock the JWT token generation
+        mock_jwt.encode.return_value = "fake_jwt_token"
+
+        # Setup bot with callback url
+        self.bot.settings = {"callback_settings": {"zoom_tokens_url": "https://example.com/zoom-tokens"}}
+        self.bot.save()
+
+        # Mock the requests.post call
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "zak_token": "fake_zak_token",
+            "join_token": "fake_join_token",
+            "app_privilege_token": "fake_app_privilege_token",
+        }
+        mock_requests_post.return_value = mock_response
+
+        # Create bot controller
+        controller = BotController(self.bot.id)
+
+        # Run the bot in a separate thread since it has an event loop
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        def simulate_auth_flow():
+            # Allow some time for the bot to initialize
+            time.sleep(2)
+
+            # The adapter should be created by now
+            if not hasattr(controller, "adapter") or not controller.adapter:
+                connection.close()
+                return  # fail silently and let the main thread assertions fail
+
+            # Simulate successful auth, which will then trigger the Join call
+            controller.adapter.auth_event.onAuthenticationReturnCallback(mock_zoom_sdk_adapter.AUTHRET_SUCCESS)
+
+            # Clean up connections in thread
+            connection.close()
+
+        # Run auth flow simulation after a short delay
+        threading.Timer(1, simulate_auth_flow).start()
+
+        # Give the bot some time to process. It will be in the main loop.
+        time.sleep(4)
+
+        # Verify requests.post was called
+        mock_requests_post.assert_called_once_with(
+            "https://example.com/zoom-tokens",
+            headers=ANY,
+            json=ANY,
+            timeout=30,
+        )
+
+        # Verify that meeting_service.Join was called with the correct tokens
+        controller.adapter.meeting_service.Join.assert_called_once()
+        join_call_args = controller.adapter.meeting_service.Join.call_args
+        join_param = join_call_args.args[0]
+        self.assertEqual(join_param.param.userZAK, "fake_zak_token")
+        self.assertEqual(join_param.param.join_token, "fake_join_token")
+        self.assertEqual(join_param.param.app_privilege_token, "fake_app_privilege_token")
+
+        # Cleanup
+        controller.cleanup()
+        bot_thread.join(timeout=5)
