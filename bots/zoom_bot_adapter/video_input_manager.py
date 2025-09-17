@@ -164,7 +164,7 @@ class VideoInputStream:
             return False
 
         current_time = time.time()
-        if current_time - self.last_frame_time >= 0.25 and self.raw_data_status == zoom.RawData_Off:
+        if current_time - self.last_frame_time >= 0.25 and (self.raw_data_status == zoom.RawData_Off or self.video_input_manager.recording_is_paused()):
             # Create a black frame of the same dimensions
             black_frame = create_black_i420_frame(self.video_input_manager.video_frame_size)
             self.video_input_manager.new_frame_callback(black_frame, time.time_ns())
@@ -192,6 +192,9 @@ class VideoInputStream:
         current_time_ns = time.time_ns()
 
         if self.renderer_destroyed:
+            return
+
+        if self.video_input_manager.recording_is_paused():
             return
 
         if not self.video_input_manager.wants_frames_for_user(self.user_id):
@@ -222,9 +225,10 @@ class VideoInputManager:
         ACTIVE_SPEAKER = 1
         ACTIVE_SHARER = 2
 
-    def __init__(self, *, new_frame_callback, wants_any_frames_callback, video_frame_size):
+    def __init__(self, *, new_frame_callback, wants_any_frames_callback, video_frame_size, recording_is_paused_callback):
         self.new_frame_callback = new_frame_callback
         self.wants_any_frames_callback = wants_any_frames_callback
+        self.recording_is_paused_callback = recording_is_paused_callback
         self.video_frame_size = video_frame_size
         self.mode = None
         self.input_streams = []
@@ -288,6 +292,9 @@ class VideoInputManager:
                     }
                 ]
             )
+
+    def recording_is_paused(self):
+        return self.recording_is_paused_callback()
 
     def wants_frames_for_user(self, user_id):
         if not self.wants_any_frames_callback():
